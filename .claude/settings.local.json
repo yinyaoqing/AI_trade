@@ -1,0 +1,34 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:sinotrade.github.io)",
+      "Bash(pip show:*)",
+      "Bash(pip install:*)",
+      "Read(//c/Users/yinya/AppData/Local/Programs/**)",
+      "Bash(ls /c/Python*)",
+      "Read(//mnt/c/Users/yinya/AppData/Local/Programs/**)",
+      "Bash(/c/Users/yinya/AppData/Local/Microsoft/WindowsApps/python3.exe --version)",
+      "Bash(/c/Users/yinya/AppData/Local/Microsoft/WindowsApps/python3.exe -m pip install shioaji)",
+      "Bash(cmd.exe /c \"py --version\")",
+      "Bash(cmd.exe /c \"python --version\")",
+      "Bash(cmd.exe /c \"py -3 --version 2>&1 && py -3 -m pip install shioaji 2>&1\")",
+      "Bash(cmd.exe /c \"where python 2>&1 & where py 2>&1 & where pip 2>&1\")",
+      "Read(//c/Users/yinya/AppData/Local/**)",
+      "Read(//c/ProgramData/**)",
+      "Read(//c/Users/yinya/**)",
+      "Bash(uv --version)",
+      "Bash(mkdir -p /c/Users/yinya/git/AI_trade/.claude/commands)",
+      "Bash(mkdir -p /c/Users/yinya/git/AI_trade/src/ai_trade)",
+      "Bash(mkdir -p /c/Users/yinya/git/AI_trade/tests)",
+      "Bash(cmd.exe /c \"where python 2>&1\")",
+      "Bash(cmd.exe /c \"python --version 2>&1\")",
+      "Bash(find /c/Users/yinya -name python*.exe)",
+      "Bash(PYTHON=/c/Users/yinya/AppData/Local/Programs/Python/Python312/python.exe)",
+      "Bash(\"$PYTHON\" --version)",
+      "Bash(\"$PYTHON\" -m pip show shioaji)",
+      "Bash(/c/Users/yinya/AppData/Local/Programs/Python/Python312/python.exe main.py)",
+      "Bash(/c/Users/yinya/AppData/Local/Programs/Python/Python312/python.exe -m pip install python-dotenv)",
+      "Bash(/c/Users/yinya/AppData/Local/Programs/Python/Python312/python.exe -m pip install python-dotenv -q)"
+    ]
+  }
+}

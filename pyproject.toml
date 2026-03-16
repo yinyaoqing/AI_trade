@@ -1,0 +1,21 @@
+[project]
+name = "ai-trade"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = [
+    "shioaji>=1.2.0",
+    "python-dotenv>=1.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

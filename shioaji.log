@@ -1,0 +1,5 @@
+[E 2026-03-16 13:20:02,704 C:\Users\yinya\AppData\Local\Programs\Python\Python312\Lib\site-packages\shioaji\shioaji.py:436:place_order] {'status': {'status_code': 406}, 'response': {'detail': 'Please sign 9A9J00271635 first.'}}
+[E 2026-03-16 13:21:04,650 C:\Users\yinya\git\AI_trade\.venv\Lib\site-packages\shioaji\shioaji.py:436:place_order] {'status': {'status_code': 406}, 'response': {'detail': 'Please sign 9A9J00271635 first.'}}
+[E 2026-03-16 13:24:59,939 C:\Users\yinya\AppData\Local\Programs\Python\Python312\Lib\site-packages\shioaji\shioaji.py:436:place_order] {'status': {'status_code': 406}, 'response': {'detail': 'Please sign 9A9J00271635 first.'}}
+[E 2026-03-16 13:25:14,188 C:\Users\yinya\AppData\Local\Programs\Python\Python312\Lib\site-packages\shioaji\shioaji.py:436:place_order] {'status': {'status_code': 406}, 'response': {'detail': 'Please sign 9A9J00271635 first.'}}
+[E 2026-03-16 13:25:44,889 C:\Users\yinya\git\AI_trade\.venv\Lib\site-packages\shioaji\shioaji.py:436:place_order] {'status': {'status_code': 406}, 'response': {'detail': 'Please sign 9A9J00271635 first.'}}
