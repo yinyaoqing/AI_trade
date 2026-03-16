@@ -1,0 +1,51 @@
+name: AI Trade Bot
+
+on:
+  schedule:
+    # 每週一至五 00:50 UTC = 台灣時間 08:50，開盤前啟動
+    - cron: '50 0 * * 1-5'
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: '手動觸發原因'
+        required: false
+        default: '手動測試'
+
+jobs:
+  trading-bot:
+    name: 執行模擬交易機器人
+    runs-on: ubuntu-latest
+    timeout-minutes: 300   # 5 小時上限，涵蓋完整交易時段（09:05-13:25 CST）
+
+    steps:
+      - name: Checkout 程式碼
+        uses: actions/checkout@v4
+
+      - name: 設定 Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: 安裝套件
+        run: pip install -r requirements.txt
+
+      - name: 還原 CA 憑證（.pfx）
+        run: |
+          echo "${{ secrets.CA_CERT_B64 }}" | base64 -d > /tmp/sinopac.pfx
+          echo "CA_CERT_PATH=/tmp/sinopac.pfx" >> $GITHUB_ENV
+
+      - name: 執行交易機器人
+        env:
+          API_KEY:              ${{ secrets.API_KEY }}
+          SECRET_KEY:           ${{ secrets.SECRET_KEY }}
+          CA_PASSWORD:          ${{ secrets.CA_PASSWORD }}
+          OPENAI_API_KEY:       ${{ secrets.OPENAI_API_KEY }}
+          TELEGRAM_BOT_TOKEN:   ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:     ${{ secrets.TELEGRAM_CHAT_ID }}
+          HTTPS_PROXY:          ${{ secrets.HTTPS_PROXY }}
+        run: python bot.py
+
+      - name: 清除憑證
+        if: always()
+        run: rm -f /tmp/sinopac.pfx
