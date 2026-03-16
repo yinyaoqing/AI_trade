@@ -30,6 +30,37 @@ jobs:
       - name: 安裝套件
         run: pip install -r requirements.txt
 
+      - name: 驗證 Secrets 格式
+        env:
+          API_KEY:    ${{ secrets.API_KEY || '' }}
+          SECRET_KEY: ${{ secrets.SECRET_KEY || '' }}
+        run: |
+          python - <<'EOF'
+          import os, sys, base64
+          errors = []
+
+          api_key    = os.environ.get("API_KEY", "").strip()
+          secret_key = os.environ.get("SECRET_KEY", "").strip()
+
+          if not api_key:
+              errors.append("API_KEY 未設定")
+          if not secret_key:
+              errors.append("SECRET_KEY 未設定")
+          else:
+              try:
+                  decoded = base64.b64decode(secret_key)
+                  if len(decoded) != 32:
+                      errors.append(f"SECRET_KEY 解碼後長度 {len(decoded)} bytes（應為 32）")
+              except Exception:
+                  errors.append("SECRET_KEY 不是有效的 base64 字串")
+
+          if errors:
+              for e in errors:
+                  print(f"[Secrets 驗證] 錯誤: {e}")
+              sys.exit(1)
+          print("[Secrets 驗證] API_KEY / SECRET_KEY 格式正確")
+          EOF
+
       - name: 還原 CA 憑證（.pfx）
         run: |
           echo "${{ secrets.CA_CERT_B64 }}" | base64 -d > /tmp/sinopac.pfx
