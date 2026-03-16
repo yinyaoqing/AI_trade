@@ -161,9 +161,13 @@ class AITradingBot:
     def __init__(self):
         self.api = sj.Shioaji(simulation=True)
 
+        # 清除環境變數中可能夾帶的空白、換行（GitHub Actions Secrets 常見問題）
+        api_key    = os.environ["API_KEY"].strip()
+        secret_key = os.environ["SECRET_KEY"].strip()
+
         accounts = self.api.login(
-            api_key=os.environ["API_KEY"],
-            secret_key=os.environ["SECRET_KEY"],
+            api_key=api_key,
+            secret_key=secret_key,
             fetch_contract=False,
         )
         print("[初始化] 下載合約中...")
@@ -173,8 +177,8 @@ class AITradingBot:
             contracts_cb=lambda: print("[初始化] 合約下載完成"),
         )
         self.api.activate_ca(
-            ca_path=os.environ["CA_CERT_PATH"],
-            ca_passwd=os.environ["CA_PASSWORD"],
+            ca_path=os.environ["CA_CERT_PATH"].strip(),
+            ca_passwd=os.environ["CA_PASSWORD"].strip(),
         )
         self.api.set_default_account(accounts[1])
         print(f"[初始化] 登入成功，帳戶：{[str(a.account_id) for a in accounts]}")
