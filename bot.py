@@ -548,7 +548,64 @@ class AITradingBot:
         trade = self.api.place_order(contract, order)
         print(f"[下單] {action} {contract.code} x{qty} @ {price}  狀態: {trade.status.status}")
 
+    def daily_summary(self) -> str:
+        """產生今日交易總結，包含成交紀錄、損益與持倉狀況"""
+        lines = [f"[今日交易總結] {now_tw().strftime('%Y-%m-%d')}"]
+        lines.append("─" * 32)
+
+        # 成交紀錄
+        try:
+            trades = self.api.list_trades(self.api.stock_account)
+            today  = now_tw().strftime("%Y-%m-%d")
+            today_trades = [
+                t for t in (trades or [])
+                if hasattr(t, "status") and
+                str(getattr(t.status, "order_datetime", "")).startswith(today)
+            ]
+            if today_trades:
+                lines.append(f"成交紀錄（{len(today_trades)} 筆）：")
+                for t in today_trades:
+                    action = getattr(t.order, "action", "-")
+                    code   = getattr(t.contract, "code", "-")
+                    price  = getattr(t.order, "price", "-")
+                    qty    = getattr(t.order, "quantity", "-")
+                    status = getattr(t.status, "status", "-")
+                    lines.append(f"  {action} {code}  {qty}股 @ {price}  {status}")
+            else:
+                lines.append("成交紀錄：今日無成交")
+        except Exception as e:
+            lines.append(f"成交紀錄：查詢失敗 ({e})")
+
+        lines.append("─" * 32)
+
+        # 未實現損益（現有持倉）
+        summary = self.get_positions_summary()
+        lines.append(f"收盤持倉：\n{summary}")
+
+        lines.append("─" * 32)
+
+        # 已實現損益
+        try:
+            today_str = now_tw().strftime("%Y-%m-%d")
+            pnl_list  = self.api.list_profit_loss(
+                self.api.stock_account,
+                begin_date=today_str,
+                end_date=today_str,
+            )
+            if pnl_list:
+                total_realized = sum(getattr(p, "profitloss", 0) or 0 for p in pnl_list)
+                lines.append(f"已實現損益：{total_realized:+.0f} 元（{len(pnl_list)} 筆）")
+            else:
+                lines.append("已實現損益：今日無已實現損益")
+        except Exception as e:
+            lines.append(f"已實現損益：查詢失敗 ({e})")
+
+        return "\n".join(lines)
+
     def logout(self) -> None:
+        summary = self.daily_summary()
+        print(f"\n{summary}")
+        send_notify(summary)
         self.api.logout()
         print("[系統] 已登出")
 
