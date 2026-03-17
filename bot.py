@@ -55,6 +55,9 @@ SLIPPAGE_LIMIT    = 0.005   # 滑點保護：買賣價差 > 0.5% 不交易
 SCAN_INTERVAL          = 60    # 主循環間隔（秒）
 NEWS_DIGEST_INTERVAL   = 1800  # 非交易時間新聞推播間隔（秒）
 
+# 固定監控標的（不受漏斗掃描影響，每輪必掃）
+PINNED_STOCKS: tuple[str, ...] = ("2330",)  # 台積電
+
 openai_client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 tg_token   = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 tg_chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
@@ -256,9 +259,72 @@ class AITradingBot:
         print(f"[初始化] 所有帳戶：{[str(a.account_id) for a in accounts]}")
 
         self.positions: dict[str, Position] = {}
-        self.watch_list: list[str] = []          # 由漏斗掃描器動態更新
+        self.watch_list: list[str] = list(PINNED_STOCKS)  # 固定標的，漏斗結果會合併
         self.funnel = FunnelScanner(self.api, get_ai_sentiment)
         self._funnel_done_today: str = ""        # 記錄已執行掃描的日期
+
+        # 啟動時同步實際持倉
+        self._sync_positions_from_api()
+
+    # ------------------------------------------------------------------
+    # 持倉同步：將 API 實際持倉載入 self.positions
+    # ------------------------------------------------------------------
+    def _sync_positions_from_api(self) -> None:
+        """查詢券商實際持倉，載入 self.positions，避免重啟後遺漏持股"""
+        try:
+            held = self.api.list_positions(self.api.stock_account)
+            if not held:
+                print("[持倉] 目前無持股")
+                return
+
+            print(f"[持倉] 查詢到 {len(held)} 筆持股，同步中...")
+            for p in held:
+                code = p.code
+                if code in self.positions:
+                    continue  # 已有紀錄，不覆蓋
+                avg_price = getattr(p, "price", None) or getattr(p, "average_price", 0)
+                qty       = getattr(p, "quantity", 0)
+                self.positions[code] = Position(
+                    code=code,
+                    entry_price=float(avg_price),
+                    qty=int(qty),
+                )
+                print(
+                    f"  {code}  均價={avg_price}  持股={qty}張  "
+                    f"現值≈{getattr(p, 'last_price', '-')}  "
+                    f"損益={getattr(p, 'pnl', '-')}"
+                )
+        except Exception as e:
+            print(f"[持倉] 查詢失敗: {e}")
+
+    def get_positions_summary(self) -> str:
+        """回傳持倉摘要字串（供啟動通知與定時推播使用）"""
+        try:
+            held = self.api.list_positions(self.api.stock_account)
+        except Exception as e:
+            return f"（持倉查詢失敗: {e}）"
+
+        if not held:
+            return "目前無持股"
+
+        lines = []
+        total_pnl = 0.0
+        for p in held:
+            code      = p.code
+            qty       = getattr(p, "quantity", 0)
+            avg_price = getattr(p, "price", None) or getattr(p, "average_price", 0)
+            last      = getattr(p, "last_price", avg_price) or avg_price
+            pnl       = getattr(p, "pnl", None)
+            if pnl is None and avg_price:
+                pnl = (float(last) - float(avg_price)) * int(qty)
+            total_pnl += float(pnl or 0)
+            pct = (float(last) - float(avg_price)) / float(avg_price) * 100 if avg_price else 0
+            lines.append(
+                f"  {code}  {qty}股  均價={avg_price}  現價={last}  "
+                f"損益={pnl:+.0f}元 ({pct:+.2f}%)"
+            )
+        lines.append(f"  合計未實現損益：{total_pnl:+.0f} 元")
+        return "\n".join(lines)
 
     # ------------------------------------------------------------------
     # 漏斗掃描：每日 09:20 執行一次，動態更新監控清單
@@ -278,8 +344,12 @@ class AITradingBot:
             print("[漏斗] 今日無精選標的，維持現有監控清單。")
             return
 
-        self.watch_list = [r.code for r in results]
-        print(f"[漏斗] 更新監控清單：{self.watch_list}")
+        funnel_codes = [r.code for r in results]
+        # 固定標的永遠保留，漏斗結果去重合併
+        merged = list(dict.fromkeys(list(PINNED_STOCKS) + funnel_codes))
+        self.watch_list = merged
+        print(f"[漏斗] 固定標的：{list(PINNED_STOCKS)}  漏斗精選：{funnel_codes}")
+        print(f"[漏斗] 合併監控清單：{self.watch_list}")
 
         # 推播精選結果
         lines = [f"[漏斗掃描結果] {now.strftime('%H:%M')}"]
@@ -498,13 +568,17 @@ if __name__ == "__main__":
     )
     print(f"[啟動分析] 情緒分: {startup_score:+.2f}  {startup_analysis}")
 
+    positions_summary = bot.get_positions_summary()
+    print(f"[持倉]\n{positions_summary}")
+
     send_notify(
         f"[AI Trade 啟動]\n"
         f"模式：simulation=True\n"
         f"部位上限：{MAX_POSITIONS} 檔 | 單筆：{POSITION_SIZE:,} 元\n"
         f"止損 {STOP_LOSS_PCT:.0%} | 移動止盈 {TRAILING_START:.1%}→{TRAILING_PULLBACK:.1%} | 滑點 {SLIPPAGE_LIMIT:.1%}\n"
         f"漏斗掃描：每日 {FUNNEL_SCAN_HOUR:02d}:{FUNNEL_SCAN_MINUTE:02d} 動態更新監控清單\n"
-        f"啟動時間：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+        f"啟動時間：{now_tw().strftime('%Y-%m-%d %H:%M:%S')} CST\n"
+        f"\n[目前持倉]\n{positions_summary}\n"
         f"\n[啟動情緒分析]\n"
         f"分數：{startup_score:+.2f}  {sentiment_label(startup_score)}\n"
         f"摘要：{startup_analysis}\n"
