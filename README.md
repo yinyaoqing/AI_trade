@@ -190,6 +190,7 @@ python main.py
 | `NEWS_DIGEST_INTERVAL` | 1,800 秒 | 非交易時間推播間隔 |
 | `FUNNEL_SCAN_HOUR/MINUTE` | 09:20 | 漏斗掃描觸發時間 |
 | `FUNNEL_MAX_RESULTS` | 5 | 漏斗精選最大標的數 |
+| `PINNED_STOCKS` | `("2330",)` | 固定監控標的（不受漏斗掃描影響，永遠包含在監控清單中） |
 | AI 進場門檻 | 0.6 | GPT-4o 分數須高於此值才進場 |
 | 大盤均線 | 20 日 MA | 以 0050 ETF 代表大盤趨勢 |
 
@@ -209,7 +210,7 @@ python main.py
 
 | 事件 | 通知內容 |
 |------|----------|
-| 程式啟動 | 系統設定 + 啟動情緒分析 + 新聞摘要（含連結） |
+| 程式啟動 | 系統設定 + **目前持倉狀況** + 啟動情緒分析 + 新聞摘要（含連結） |
 | 每輪 AI 分析 | 情緒分數 + 利多/中性/利空 + 摘要文字 |
 | 買進成交 | 股票代號、成交價、數量、VWAP、情緒分、摘要 |
 | 移動止盈觸發 | 股票代號、賣出價、最高價、回吐幅度、最終獲利 |
@@ -220,7 +221,7 @@ python main.py
 
 ## 漏斗篩選系統
 
-監控清單由 `src/ai_trade/scanner.py` 的 `FunnelScanner` 每日 09:20 自動產生，不需手動設定。
+監控清單由 `src/ai_trade/scanner.py` 的 `FunnelScanner` 每日 09:20 自動產生，不需手動設定。`PINNED_STOCKS` 中的固定標的（預設台積電 2330）會永遠保留在清單中，不受漏斗結果影響。
 
 ### 三層篩選流程
 
@@ -453,6 +454,7 @@ base64 -w 0 sinopac.pfx          # Linux（複製輸出）
 
 - **`simulation=True` 模式** — 所有委託均為模擬，不會動用真實資金
 - **金鑰安全** — `.env` 已加入 `.gitignore`，請勿 commit 憑證或金鑰；若不慎外洩請立即至 BotFather 執行 `/revoke`
+- **時區** — 所有交易時間判斷均以台灣時間（UTC+8）為基準，可安全部署至 GitHub Actions（UTC 伺服器）
 - **連線限制** — 同一帳號最多 5 條同時連線，避免短時間重複啟動
 - **流量限制** — 市場資料每 5 秒最多 50 筆請求；委託每 10 秒最多 250 筆
 - **交易時間** — 盤中零股僅限 09:05–13:25，程式已自動判斷
@@ -469,7 +471,10 @@ AI_trade/
 ├── src/ai_trade/
 │   ├── __init__.py
 │   ├── client.py             # ShioajiClient 封裝類別
-│   └── news.py               # 新聞聚合器（鉅亨網 / Yahoo / Google News）
+│   ├── news.py               # 新聞聚合器（鉅亨網 / Yahoo / Google News）
+│   └── scanner.py            # 三層漏斗掃描器（FunnelScanner）
+├── .github/workflows/
+│   └── trading_bot.yml       # GitHub Actions 自動排程
 ├── pyproject.toml            # 套件設定
 ├── requirements.txt          # 套件清單
 ├── .env                      # 金鑰設定（git-ignored）
