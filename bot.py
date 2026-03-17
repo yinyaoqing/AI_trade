@@ -157,31 +157,96 @@ def sentiment_label(score: float) -> str:
 # 4. 核心交易邏輯
 # =============================================================================
 
+def _debug_env() -> None:
+    """啟動時印出環境變數摘要（敏感值遮蔽），協助診斷 GitHub Actions 問題"""
+    import base64
+
+    def mask(v: str, show: int = 4) -> str:
+        v = v.strip()
+        if not v:
+            return "(未設定)"
+        if len(v) <= show * 2:
+            return "***"
+        return v[:show] + "***" + v[-show:]
+
+    vars_info = {
+        "API_KEY":            os.environ.get("API_KEY", ""),
+        "SECRET_KEY":         os.environ.get("SECRET_KEY", ""),
+        "CA_CERT_PATH":       os.environ.get("CA_CERT_PATH", ""),
+        "CA_PASSWORD":        os.environ.get("CA_PASSWORD", ""),
+        "OPENAI_API_KEY":     os.environ.get("OPENAI_API_KEY", ""),
+        "TELEGRAM_BOT_TOKEN": os.environ.get("TELEGRAM_BOT_TOKEN", ""),
+        "TELEGRAM_CHAT_ID":   os.environ.get("TELEGRAM_CHAT_ID", ""),
+    }
+
+    print("[Debug] ── 環境變數摘要 ────────────────────────────")
+    for k, v in vars_info.items():
+        stripped = v.strip()
+        print(f"  {k:<22}: {mask(stripped)}  (len={len(stripped)})")
+
+    # SECRET_KEY 額外診斷
+    sk = os.environ.get("SECRET_KEY", "").strip()
+    if sk:
+        print("[Debug] ── SECRET_KEY 診斷 ─────────────────────────")
+        try:
+            decoded = base64.b64decode(sk + "==")
+            print(f"  base64解碼長度  : {len(decoded)} bytes (Shioaji 需要 32)")
+            if len(decoded) != 32:
+                print(f"  建議            : 重新從永豐金 API 管理頁複製正確的 SECRET_KEY")
+        except Exception as ex:
+            print(f"  base64解碼失敗  : {ex}")
+        has_newline = "\n" in sk or "\r" in sk
+        non_b64 = [c for c in sk if c not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/="]
+        print(f"  含換行符號      : {has_newline}")
+        print(f"  非base64字元    : {non_b64 if non_b64 else '無'}")
+
+    # CA 憑證檔案檢查
+    ca_path = os.environ.get("CA_CERT_PATH", "").strip()
+    if ca_path:
+        import pathlib
+        p = pathlib.Path(ca_path)
+        exists = p.exists()
+        size   = p.stat().st_size if exists else 0
+        print(f"[Debug] CA憑證     : {ca_path}  存在={exists}  大小={size} bytes")
+
+    print("[Debug] ─────────────────────────────────────────────")
+
+
 class AITradingBot:
     def __init__(self):
+        _debug_env()
+
         self.api = sj.Shioaji(simulation=True)
+        print("[初始化] Shioaji 實例建立完成")
 
         # 清除環境變數中可能夾帶的空白、換行（GitHub Actions Secrets 常見問題）
         api_key    = os.environ["API_KEY"].strip()
         secret_key = os.environ["SECRET_KEY"].strip()
 
+        print(f"[初始化] 嘗試登入（API_KEY 長度={len(api_key)}，SECRET_KEY 長度={len(secret_key)}）")
         accounts = self.api.login(
             api_key=api_key,
             secret_key=secret_key,
             fetch_contract=False,
         )
+        print(f"[初始化] 登入回應：{accounts}")
+
         print("[初始化] 下載合約中...")
         self.api.fetch_contracts(
             contract_download=True,
             contracts_timeout=30000,
             contracts_cb=lambda: print("[初始化] 合約下載完成"),
         )
-        self.api.activate_ca(
-            ca_path=os.environ["CA_CERT_PATH"].strip(),
-            ca_passwd=os.environ["CA_PASSWORD"].strip(),
-        )
+
+        ca_path = os.environ["CA_CERT_PATH"].strip()
+        ca_pass = os.environ["CA_PASSWORD"].strip()
+        print(f"[初始化] 啟用 CA 憑證：{ca_path}")
+        self.api.activate_ca(ca_path=ca_path, ca_passwd=ca_pass)
+        print("[初始化] CA 憑證啟用成功")
+
         self.api.set_default_account(accounts[1])
-        print(f"[初始化] 登入成功，帳戶：{[str(a.account_id) for a in accounts]}")
+        print(f"[初始化] 預設帳戶：{accounts[1]}")
+        print(f"[初始化] 所有帳戶：{[str(a.account_id) for a in accounts]}")
 
         self.positions: dict[str, Position] = {}
         self.watch_list: list[str] = []          # 由漏斗掃描器動態更新
