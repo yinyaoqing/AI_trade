@@ -67,26 +67,12 @@ jobs:
               else:
                   print("  可見字元   : OK")
 
-              # 4. 嘗試各種 base64 解碼策略
-              strategies = [
-                  ("原始值", key),
-                  ("去頭尾空白", key.strip()),
-                  ("去換行", key.replace("\n", "").replace("\r", "")),
-                  ("移除最後一個=", key.rstrip("=").rstrip("=") + "=="),
-              ]
-              for label, k in strategies:
-                  try:
-                      decoded = base64.b64decode(k + "==")
-                      print(f"  base64解碼[{label}]: {len(decoded)} bytes", end="")
-                      if len(decoded) == 32:
-                          print(" ✓ 正確")
-                      else:
-                          print(f" ✗ 非32bytes")
-                  except Exception as ex:
-                      print(f"  base64解碼[{label}]: 失敗 ({ex})")
-
-              # 5. 直接作為 UTF-8 bytes 的長度
-              print(f"  直接UTF-8長度: {len(raw_bytes)} bytes")
+              # 4. base64 資訊（僅供診斷，不阻止執行，Shioaji 內部處理格式不同）
+              try:
+                  decoded = base64.b64decode(key + "==")
+                  print(f"  base64解碼長度 : {len(decoded)} bytes（僅供參考，不影響登入）")
+              except Exception as ex:
+                  issues.append(f"SECRET_KEY 不是有效的 base64 字串: {ex}")
 
               return issues
 
@@ -138,7 +124,8 @@ jobs:
           OPENAI_API_KEY:       ${{ secrets.OPENAI_API_KEY }}
           TELEGRAM_BOT_TOKEN:   ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:     ${{ secrets.TELEGRAM_CHAT_ID }}
-          HTTPS_PROXY:          ${{ secrets.HTTPS_PROXY }}
+          # HTTPS_PROXY: 選填，若需要 Proxy 才能連 Telegram，請在 Secrets 加入後取消此行註解
+          # HTTPS_PROXY: ${{ secrets.HTTPS_PROXY }}
         run: python bot.py
 
       - name: 清除憑證

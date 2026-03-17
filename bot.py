@@ -20,8 +20,15 @@ import pandas as pd
 import pandas_ta as ta
 import requests
 from openai import OpenAI
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
+
+TZ_TW = timezone(timedelta(hours=8))  # 台灣時間 UTC+8
+
+
+def now_tw() -> datetime:
+    """回傳台灣當地時間（不論伺服器在哪）"""
+    return datetime.now(TZ_TW)
 from src.ai_trade.news import NewsAggregator
 from src.ai_trade.scanner import FunnelScanner
 
@@ -508,7 +515,7 @@ if __name__ == "__main__":
 
     try:
         while True:
-            now = datetime.now()
+            now = now_tw()   # 台灣時間
             in_market = (
                 (now.hour == 9 and now.minute >= 5)
                 or (9 < now.hour < 13)
@@ -516,7 +523,7 @@ if __name__ == "__main__":
             )
 
             if in_market:
-                print(f"\n[{now.strftime('%H:%M:%S')}] 交易時間掃描  部位：{list(bot.positions.keys()) or '無'}")
+                print(f"\n[{now.strftime('%H:%M:%S')} CST] 交易時間掃描  部位：{list(bot.positions.keys()) or '無'}")
 
                 # 出場監控（每輪必跑，不受任何過濾影響）
                 bot.monitor_exit()
@@ -559,7 +566,7 @@ if __name__ == "__main__":
                     print(f"[策略] 市場情緒不足（{score:.2f}），不進場。")
 
             else:
-                print(f"[{now.strftime('%H:%M:%S')}] 非交易時間  部位：{list(bot.positions.keys()) or '無'}")
+                print(f"[{now.strftime('%H:%M:%S')} CST] 非交易時間  部位：{list(bot.positions.keys()) or '無'}")
                 if time.time() - last_digest_sent >= NEWS_DIGEST_INTERVAL:
                     digest = market_agg.format_telegram_digest(limit=10)
                     send_notify(
