@@ -150,9 +150,19 @@ def get_ai_sentiment(news_text: str) -> tuple[float, str]:
 
 
 def ticks_to_df(ticks) -> pd.DataFrame:
+    """將 Shioaji ticks 轉為 DataFrame，統一欄位名稱為 pandas_ta 所需格式（大寫）"""
     df = pd.DataFrame({**ticks.dict()})
     df["datetime"] = pd.to_datetime(df["ts"])
-    return df.set_index("datetime").sort_index()
+    df = df.set_index("datetime").sort_index()
+    # Shioaji ticks 欄位皆為小寫，pandas_ta.vwap 需要大寫
+    rename = {"open": "Open", "high": "High", "low": "Low",
+              "close": "Close", "volume": "Volume", "amount": "Amount"}
+    df = df.rename(columns={k: v for k, v in rename.items() if k in df.columns})
+    # ticks 只有成交價（close），補齊 High/Low/Open 供 VWAP 計算
+    for col in ("High", "Low", "Open"):
+        if col not in df.columns and "Close" in df.columns:
+            df[col] = df["Close"]
+    return df
 
 
 def sentiment_label(score: float) -> str:
@@ -371,7 +381,7 @@ class AITradingBot:
             kbars = self.api.kbars(
                 contract,
                 start="2025-09-01",
-                end=datetime.now().strftime("%Y-%m-%d"),
+                end=now_tw().strftime("%Y-%m-%d"),
             )
             df = pd.DataFrame({**kbars.dict()}).set_index("ts").sort_index()
             ma20 = df["Close"].rolling(20).mean().iloc[-1]
@@ -425,7 +435,7 @@ class AITradingBot:
                 return
 
             # VWAP
-            ticks = self.api.ticks(contract, date=datetime.now().strftime("%Y-%m-%d"))
+            ticks = self.api.ticks(contract, date=now_tw().strftime("%Y-%m-%d"))
             df = ticks_to_df(ticks)
             vwap = ta.vwap(df["High"], df["Low"], df["Close"], df["Volume"]).iloc[-1]
             current_price = df["Close"].iloc[-1]
@@ -645,7 +655,7 @@ if __name__ == "__main__":
                     digest = market_agg.format_telegram_digest(limit=10)
                     send_notify(
                         f"[新聞摘要] {now.strftime('%Y-%m-%d %H:%M')}\n"
-                        f"監控：{', '.join(WATCH_LIST)}\n"
+                        f"監控：{', '.join(bot.watch_list) or '（待漏斗掃描）'}\n"
                         f"{'─' * 28}\n{digest}"
                     )
                     last_digest_sent = time.time()
