@@ -36,29 +36,93 @@ jobs:
           SECRET_KEY: ${{ secrets.SECRET_KEY || '' }}
         run: |
           python - <<'EOF'
-          import os, sys, base64
+          import os, sys, base64, re
+
+          def mask(s: str) -> str:
+              """顯示前4後4字元，中間以*遮蔽"""
+              if len(s) <= 8:
+                  return "***"
+              return s[:4] + "*" * (len(s) - 8) + s[-4:]
+
+          def diagnose_secret_key(key: str) -> list[str]:
+              issues = []
+              raw_bytes = key.encode("utf-8")
+
+              # 1. 長度資訊
+              print(f"  字元數     : {len(key)}")
+              print(f"  UTF-8 bytes: {len(raw_bytes)}")
+              print(f"  內容(遮蔽) : {mask(key)}")
+
+              # 2. 非 ASCII 字元
+              non_ascii = [(i, hex(ord(c))) for i, c in enumerate(key) if ord(c) > 127]
+              if non_ascii:
+                  issues.append(f"含非ASCII字元：{non_ascii}")
+              else:
+                  print("  ASCII 檢查 : OK（無非ASCII字元）")
+
+              # 3. 不可見字元（空白以外）
+              invisible = [(i, repr(c)) for i, c in enumerate(key) if c not in (' ', '\t') and not c.isprintable()]
+              if invisible:
+                  issues.append(f"含不可見字元：{invisible}")
+              else:
+                  print("  可見字元   : OK")
+
+              # 4. 嘗試各種 base64 解碼策略
+              strategies = [
+                  ("原始值", key),
+                  ("去頭尾空白", key.strip()),
+                  ("去換行", key.replace("\n", "").replace("\r", "")),
+                  ("移除最後一個=", key.rstrip("=").rstrip("=") + "=="),
+              ]
+              for label, k in strategies:
+                  try:
+                      decoded = base64.b64decode(k + "==")
+                      print(f"  base64解碼[{label}]: {len(decoded)} bytes", end="")
+                      if len(decoded) == 32:
+                          print(" ✓ 正確")
+                      else:
+                          print(f" ✗ 非32bytes")
+                  except Exception as ex:
+                      print(f"  base64解碼[{label}]: 失敗 ({ex})")
+
+              # 5. 直接作為 UTF-8 bytes 的長度
+              print(f"  直接UTF-8長度: {len(raw_bytes)} bytes")
+
+              return issues
+
           errors = []
+          api_key    = os.environ.get("API_KEY", "")
+          secret_key = os.environ.get("SECRET_KEY", "")
 
-          api_key    = os.environ.get("API_KEY", "").strip()
-          secret_key = os.environ.get("SECRET_KEY", "").strip()
-
-          if not api_key:
+          print("=" * 50)
+          print("[Secrets 驗證] API_KEY")
+          print(f"  字元數  : {len(api_key.strip())}")
+          if not api_key.strip():
               errors.append("API_KEY 未設定")
-          if not secret_key:
+          else:
+              print(f"  內容    : {mask(api_key.strip())}")
+
+          print("[Secrets 驗證] SECRET_KEY 詳細診斷")
+          if not secret_key.strip():
               errors.append("SECRET_KEY 未設定")
           else:
-              try:
-                  decoded = base64.b64decode(secret_key)
-                  if len(decoded) != 32:
-                      errors.append(f"SECRET_KEY 解碼後長度 {len(decoded)} bytes（應為 32）")
-              except Exception:
-                  errors.append("SECRET_KEY 不是有效的 base64 字串")
+              issues = diagnose_secret_key(secret_key.strip())
+              errors.extend(issues)
 
+          print("=" * 50)
           if errors:
               for e in errors:
                   print(f"[Secrets 驗證] 錯誤: {e}")
+              print()
+              print("解決方法：")
+              print("  1. 前往永豐金 API 管理頁面重新複製 SECRET_KEY")
+              print("     https://order.sinotrade.com.tw/newweb/api_token_manage/index")
+              print("  2. 確認複製的是單行、無空格的完整字串")
+              print("  3. 更新 GitHub Secret：")
+              print("     https://github.com/你的帳號/AI_trade/settings/secrets/actions")
               sys.exit(1)
-          print("[Secrets 驗證] API_KEY / SECRET_KEY 格式正確")
+
+          print("[Secrets 驗證] 所有 Secrets 格式正確，繼續執行。")
           EOF
 
       - name: 還原 CA 憑證（.pfx）
