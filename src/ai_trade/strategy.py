@@ -29,7 +29,7 @@ class MarketRegime(Enum):
 
 
 # 0050 近 20 日年化波動率閾值
-_VOL_THRESHOLD = 0.18   # > 18% 視為高波動（盤整震盪）
+_VOL_THRESHOLD = 0.03   # 模擬測試用 3%（正式交易改回 0.18）
 
 
 def detect_regime(api, lookback_days: int = 60) -> tuple[MarketRegime, float]:
