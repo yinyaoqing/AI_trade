@@ -302,6 +302,7 @@ class AITradingBot:
         self._funnel_done_today: str = ""        # 記錄已執行掃描的日期
         self._sentiment_scores: deque[float] = deque(maxlen=SENTIMENT_SMOOTH_N)  # 1.1 情緒平滑
         self.allocator = StrategyAllocator(self.api)                             # 3.2 多策略分配器
+        self._last_regime: str = ""              # 策略配置上次推播的 regime，相同則不重複推播
 
         # 啟動時同步實際持倉
         self._sync_positions_from_api()
@@ -370,11 +371,14 @@ class AITradingBot:
     # 漏斗掃描：每日 09:20 執行一次，動態更新監控清單
     # ------------------------------------------------------------------
     def run_funnel_if_needed(self, now: datetime) -> None:
-        """09:20 後且今日尚未執行，才觸發漏斗掃描"""
+        """09:20 後且今日尚未執行，才觸發漏斗掃描。
+        若 Bot 在 09:20 之後才啟動，當輪立即補跑一次。"""
         today = now.strftime("%Y-%m-%d")
         if self._funnel_done_today == today:
             return
-        if not (now.hour == FUNNEL_SCAN_HOUR and now.minute >= FUNNEL_SCAN_MINUTE):
+        past_scan_time = (now.hour > FUNNEL_SCAN_HOUR or
+                          (now.hour == FUNNEL_SCAN_HOUR and now.minute >= FUNNEL_SCAN_MINUTE))
+        if not past_scan_time:
             return
 
         results = self.funnel.run(max_results=FUNNEL_MAX_RESULTS)
@@ -903,11 +907,14 @@ if __name__ == "__main__":
                     # 3.2 多策略框架：依市場狀態決定策略比重
                     alloc = bot.allocator.allocate()
                     print(f"[策略] {alloc.describe()}")
-                    send_notify(
-                        f"[策略配置] {alloc.regime.value}\n"
-                        f"波動率：{alloc.vol_ann:.1%}\n"
-                        f"動能：{alloc.momentum_budget_pct:.0%}  均值回歸：{alloc.mean_reversion_budget_pct:.0%}"
-                    )
+                    # 策略配置：只在 regime 改變時推播，避免每分鐘重複通知
+                    if alloc.regime.value != bot._last_regime:
+                        bot._last_regime = alloc.regime.value
+                        send_notify(
+                            f"[策略配置變更] {alloc.regime.value}\n"
+                            f"波動率：{alloc.vol_ann:.1%}\n"
+                            f"動能：{alloc.momentum_budget_pct:.0%}  均值回歸：{alloc.mean_reversion_budget_pct:.0%}"
+                        )
 
                     if alloc.regime == MarketRegime.RANGING:
                         # 盤整市：優先執行均值回歸，動能策略次之
