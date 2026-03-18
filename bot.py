@@ -329,10 +329,11 @@ class AITradingBot:
                     entry_price=float(avg_price),
                     qty=int(qty),
                 )
+                last  = float(getattr(p, "last_price", avg_price) or avg_price)
+                pnl   = (last - float(avg_price)) * int(qty)
                 print(
-                    f"  {code}  均價={avg_price}  持股={qty}張  "
-                    f"現值≈{getattr(p, 'last_price', '-')}  "
-                    f"損益={getattr(p, 'pnl', '-')}"
+                    f"  {code}  均價={avg_price}  持股={qty}股  "
+                    f"現值≈{last}  損益={pnl:+.0f}元"
                 )
         except Exception as e:
             print(f"[持倉] 查詢失敗: {e}")
@@ -351,14 +352,13 @@ class AITradingBot:
         total_pnl = 0.0
         for p in held:
             code      = p.code
-            qty       = getattr(p, "quantity", 0)
-            avg_price = getattr(p, "price", None) or getattr(p, "average_price", 0)
-            last      = getattr(p, "last_price", avg_price) or avg_price
-            pnl       = getattr(p, "pnl", None)
-            if pnl is None and avg_price:
-                pnl = (float(last) - float(avg_price)) * int(qty)
-            total_pnl += float(pnl or 0)
-            pct = (float(last) - float(avg_price)) / float(avg_price) * 100 if avg_price else 0
+            qty       = int(getattr(p, "quantity", 0))
+            avg_price = float(getattr(p, "price", None) or getattr(p, "average_price", 0))
+            last      = float(getattr(p, "last_price", avg_price) or avg_price)
+            # 自行計算損益，避免 API pnl 欄位單位不一致問題
+            pnl = (last - avg_price) * qty
+            total_pnl += pnl
+            pct = (last - avg_price) / avg_price * 100 if avg_price else 0
             lines.append(
                 f"  {code}  {qty}股  均價={avg_price}  現價={last}  "
                 f"損益={pnl:+.0f}元 ({pct:+.2f}%)"
