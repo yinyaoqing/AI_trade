@@ -10,6 +10,7 @@ import os
 import sys
 import time
 import threading
+from collections import deque
 from dataclasses import dataclass, field
 
 os.environ.setdefault("PYTHONUNBUFFERED", "1")
@@ -31,6 +32,10 @@ def now_tw() -> datetime:
     return datetime.now(TZ_TW)
 from src.ai_trade.news import NewsAggregator
 from src.ai_trade.scanner import FunnelScanner
+from src.ai_trade.chips import chips_sentiment, chips_summary           # 2.2 籌碼流向
+from src.ai_trade.strategy import (                                      # 3.2 多策略
+    StrategyAllocator, mean_reversion_signal, MarketRegime
+)
 
 load_dotenv()
 
@@ -52,11 +57,20 @@ TRAILING_START    = 0.015   # 移動止盈啟動點：獲利達 1.5%
 TRAILING_PULLBACK = 0.01    # 移動止盈觸發：自高點回吐 1%
 SLIPPAGE_LIMIT    = 0.005   # 滑點保護：買賣價差 > 0.5% 不交易
 
+# Phase 1 優化參數
+SENTIMENT_ENABLED  = False   # 新聞情緒評分開關：False → 跳過 AI 分析，直接進入策略掃描
+SENTIMENT_SMOOTH_N = 3      # 1.1 情緒平滑：保留最近 N 次分數取均值
+RISK_PER_TRADE     = TOTAL_BUDGET * STOP_LOSS_PCT   # 1.2 ATR 動態部位：每筆承擔最大損失 (元)
+RSI_OVERBOUGHT     = 70                             # 1.3 RSI 超買門檻：超過不進場
+
+# Phase 2 優化參數
+TRADE_COST_PCT     = 0.004   # 2.3 手續費+證交稅估算（買0.1425%+賣0.1425%+賣0.3% ≈ 0.585%，保守用0.4%）
+
 SCAN_INTERVAL          = 60    # 主循環間隔（秒）
 NEWS_DIGEST_INTERVAL   = 1800  # 非交易時間新聞推播間隔（秒）
 
 # 固定監控標的（不受漏斗掃描影響，每輪必掃）
-PINNED_STOCKS: tuple[str, ...] = ("2330",)  # 台積電
+PINNED_STOCKS: tuple[str, ...] = ("2330", "2317", "2454", "3661", "3443", "3017", "3324", "8996", "3037", "2383", "2368", "2059", "8210", "6805")  # 台積電
 
 openai_client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 tg_token   = os.environ.get("TELEGRAM_BOT_TOKEN", "")
@@ -72,10 +86,24 @@ class Position:
     code: str
     entry_price: float
     qty: int
+    # 2.1 ATR 自適應止損：進場時計算，取代固定百分比
+    atr:         float = 0.0   # 進場時 ATR 值（元）
+    stop_price:  float = 0.0   # 動態止損價（entry - 1.5×ATR，最多 -2%）
+    trail_price: float = 0.0   # 移動止盈啟動價（entry + 1.0×ATR，最少 1.5%）
+    # 進場輔助資訊（供績效日誌 2.3 使用）
+    entry_score: float = 0.0
+    entry_rsi:   float = 0.0
+    entry_vwap:  float = 0.0
+    entry_chips: float = 0.0   # 法人淨買超（股，2.2）
     max_price: float = field(init=False)
 
     def __post_init__(self):
         self.max_price = self.entry_price
+        # 若未帶入 ATR，退回固定百分比
+        if self.stop_price == 0.0:
+            self.stop_price = self.entry_price * (1 - STOP_LOSS_PCT)
+        if self.trail_price == 0.0:
+            self.trail_price = self.entry_price * (1 + TRAILING_START)
 
     def update_max(self, current: float) -> None:
         if current > self.max_price:
@@ -272,6 +300,8 @@ class AITradingBot:
         self.watch_list: list[str] = list(PINNED_STOCKS)  # 固定標的，漏斗結果會合併
         self.funnel = FunnelScanner(self.api, get_ai_sentiment)
         self._funnel_done_today: str = ""        # 記錄已執行掃描的日期
+        self._sentiment_scores: deque[float] = deque(maxlen=SENTIMENT_SMOOTH_N)  # 1.1 情緒平滑
+        self.allocator = StrategyAllocator(self.api)                             # 3.2 多策略分配器
 
         # 啟動時同步實際持倉
         self._sync_positions_from_api()
@@ -372,6 +402,41 @@ class AITradingBot:
         send_notify("\n\n".join(lines))
 
     # ------------------------------------------------------------------
+    # 1.1 情緒平滑：加入新分數並回傳移動平均
+    # ------------------------------------------------------------------
+    def smooth_sentiment(self, raw: float) -> float:
+        self._sentiment_scores.append(raw)
+        smoothed = sum(self._sentiment_scores) / len(self._sentiment_scores)
+        if len(self._sentiment_scores) > 1:
+            print(f"[情緒平滑] 原始={raw:+.2f}  近{len(self._sentiment_scores)}次均值={smoothed:+.2f}")
+        return smoothed
+
+    # ------------------------------------------------------------------
+    # 1.2 ATR 動態部位：依個股波動率計算合理股數
+    # ------------------------------------------------------------------
+    def get_atr_qty(self, contract, current_price: float) -> int:
+        """回傳 ATR-based 股數（風險均等化），上限為固定預算所能買到的最大股數"""
+        fallback = max(int(POSITION_SIZE / current_price), 1)
+        try:
+            end_date   = now_tw().strftime("%Y-%m-%d")
+            start_date = (now_tw() - timedelta(days=60)).strftime("%Y-%m-%d")
+            kbars = self.api.kbars(contract, start=start_date, end=end_date)
+            df = pd.DataFrame({**kbars.dict()}).sort_values("ts")
+            if len(df) < 15:
+                return fallback
+            atr = ta.atr(df["High"], df["Low"], df["Close"], length=14).iloc[-1]
+            if not atr or pd.isna(atr) or atr <= 0:
+                return fallback
+            qty_by_risk   = int(RISK_PER_TRADE / atr)          # 風險控制上限
+            qty_by_budget = int(POSITION_SIZE / current_price)  # 預算上限
+            qty = max(min(qty_by_risk, qty_by_budget), 1)
+            print(f"[ATR] {contract.code}  ATR={atr:.2f}  風險部位={qty_by_risk}股  預算上限={qty_by_budget}股  → {qty}股")
+            return qty
+        except Exception as e:
+            print(f"[ATR] {contract.code} 計算失敗: {e}，改用預算法")
+            return fallback
+
+    # ------------------------------------------------------------------
     # 大盤趨勢過濾
     # ------------------------------------------------------------------
     def check_market_trend(self) -> bool:
@@ -434,39 +499,131 @@ class AITradingBot:
             if not self.check_slippage_safe(contract):
                 return
 
-            # VWAP
+            # VWAP + RSI（1.3）
             ticks = self.api.ticks(contract, date=now_tw().strftime("%Y-%m-%d"))
             df = ticks_to_df(ticks)
             vwap = ta.vwap(df["High"], df["Low"], df["Close"], df["Volume"]).iloc[-1]
             current_price = df["Close"].iloc[-1]
-            print(f"[{stock_code}] 現價={current_price}  VWAP={vwap:.2f}")
+
+            # 1.3 RSI 超買過濾：RSI ≥ 70 代表短期過熱，不追高
+            rsi_series = ta.rsi(df["Close"], length=14)
+            rsi = rsi_series.iloc[-1] if rsi_series is not None and not rsi_series.empty else float("nan")
+            if not pd.isna(rsi):
+                print(f"[{stock_code}] 現價={current_price}  VWAP={vwap:.2f}  RSI={rsi:.1f}")
+                if rsi >= RSI_OVERBOUGHT:
+                    print(f"[{stock_code}] RSI={rsi:.1f} 超買（≥{RSI_OVERBOUGHT}），不追高。")
+                    return
+            else:
+                print(f"[{stock_code}] 現價={current_price}  VWAP={vwap:.2f}  RSI=N/A（資料不足）")
 
             if current_price <= vwap:
                 print(f"[{stock_code}] 現價未突破 VWAP，不進場。")
                 return
 
-            qty = int(POSITION_SIZE / current_price)
-            if qty < 1:
-                print(f"[{stock_code}] 資金不足購買 1 股，跳過。")
+            # 2.2 籌碼流向：法人合計賣超（score < -0.3）時不進場
+            chip_score = chips_sentiment(stock_code)
+            print(f"  {chips_summary(stock_code)}  情緒分: {chip_score:+.2f}")
+            if chip_score < -0.3:
+                print(f"[{stock_code}] 法人持續賣超（{chip_score:+.2f}），不進場。")
                 return
 
+            # 1.2 ATR 動態部位
+            qty = self.get_atr_qty(contract, current_price)
+            if qty < 1:
+                print(f"[{stock_code}] 計算股數 < 1，跳過。")
+                return
+
+            # 2.1 計算 ATR 自適應止損 / 移動止盈啟動價
+            atr_val = 0.0
+            try:
+                end_d   = now_tw().strftime("%Y-%m-%d")
+                start_d = (now_tw() - timedelta(days=60)).strftime("%Y-%m-%d")
+                kb = self.api.kbars(contract, start=start_d, end=end_d)
+                kdf = pd.DataFrame({**kb.dict()}).sort_values("ts")
+                atr_series = ta.atr(kdf["High"], kdf["Low"], kdf["Close"], length=14)
+                atr_val = float(atr_series.iloc[-1]) if atr_series is not None and not atr_series.empty else 0.0
+            except Exception:
+                pass
+
+            stop_p  = current_price - max(1.5 * atr_val, current_price * STOP_LOSS_PCT)
+            trail_p = current_price + max(1.0 * atr_val, current_price * TRAILING_START)
+
             self._place_odd_order(contract, current_price, qty, sj.constant.Action.Buy)
-            self.positions[stock_code] = Position(
+            pos = Position(
                 code=stock_code,
                 entry_price=current_price,
                 qty=qty,
+                atr=atr_val,
+                stop_price=stop_p,
+                trail_price=trail_p,
+                entry_score=score,
+                entry_rsi=float(rsi) if not pd.isna(rsi) else 0.0,
+                entry_vwap=float(vwap),
             )
+            self.positions[stock_code] = pos
+            self._trade_log("BUY", pos, current_price)   # 2.3
             send_notify(
                 f"[買進] {stock_code}\n"
                 f"價格: {current_price}  數量: {qty} 股\n"
-                f"VWAP: {vwap:.2f}\n"
-                f"情緒分: {score:+.2f}  {analysis}"
+                f"VWAP: {vwap:.2f}  RSI: {rsi:.1f}\n"
+                f"止損價: {stop_p:.2f}  止盈啟動: {trail_p:.2f}\n"
+                f"ATR: {atr_val:.2f}  情緒: {score:+.2f}  {analysis}"
             )
         except Exception as e:
             print(f"[{stock_code}] 進場失敗: {e}")
 
     # ------------------------------------------------------------------
     # 出場監控：移動止盈 + 強制止損
+    # ------------------------------------------------------------------
+    # 3.2 均值回歸掃描（盤整市使用）
+    # ------------------------------------------------------------------
+    def scan_mean_reversion(self, stock_code: str, budget: float) -> None:
+        """RSI < 30 且現價 < VWAP 時買進，出場條件與動能策略相同"""
+        if stock_code in self.positions:
+            return
+        if len(self.positions) >= MAX_POSITIONS:
+            return
+        try:
+            contract = self.api.Contracts.Stocks[stock_code]
+            if not self.check_slippage_safe(contract):
+                return
+
+            ticks = self.api.ticks(contract, date=now_tw().strftime("%Y-%m-%d"))
+            df    = ticks_to_df(ticks)
+            sig   = mean_reversion_signal(df, stock_code)
+
+            print(f"[均值回歸] {stock_code}  {sig.reason}")
+            if sig.action != "BUY":
+                return
+
+            # 2.2 籌碼：法人大幅賣超仍跳過
+            chip_score = chips_sentiment(stock_code)
+            if chip_score < -0.5:
+                print(f"[均值回歸] {stock_code} 法人大幅賣超({chip_score:+.2f})，跳過。")
+                return
+
+            qty = max(int(budget / sig.current_price), 1)
+            self._place_odd_order(contract, sig.current_price, qty, sj.constant.Action.Buy)
+            pos = Position(
+                code=stock_code,
+                entry_price=sig.current_price,
+                qty=qty,
+                entry_score=0.0,
+                entry_rsi=sig.rsi,
+                entry_vwap=sig.vwap,
+                entry_chips=chip_score,
+            )
+            self.positions[stock_code] = pos
+            self._trade_log("BUY", pos, sig.current_price)
+            send_notify(
+                f"[均值回歸買進] {stock_code}\n"
+                f"價格: {sig.current_price}  數量: {qty} 股\n"
+                f"RSI: {sig.rsi}  VWAP: {sig.vwap}\n"
+                f"原因: {sig.reason}"
+            )
+        except Exception as e:
+            print(f"[均值回歸] {stock_code} 失敗: {e}")
+
     # ------------------------------------------------------------------
     def monitor_exit(self) -> None:
         """每輪皆執行，不受情緒/大盤過濾影響"""
@@ -496,16 +653,15 @@ class AITradingBot:
 
             reason = None
 
-            # A. 強制止損
-            if profit <= -STOP_LOSS_PCT:
-                reason = f"強制止損（虧損 {profit:.2%}）"
+            # 2.1 A. ATR 自適應止損（以絕對價格判斷，不再用固定百分比）
+            if current <= pos.stop_price:
+                reason = f"止損（現價{current} ≤ 止損價{pos.stop_price:.2f}，虧損{profit:.2%}，ATR={pos.atr:.2f}）"
 
-            # B. 移動止盈：曾獲利超過啟動點，且從高點回吐超過觸發點
-            elif profit > TRAILING_START and pullback >= TRAILING_PULLBACK:
-                # 賣出前再次確認滑點
+            # 2.1 B. ATR 自適應移動止盈
+            elif current >= pos.trail_price and pullback >= TRAILING_PULLBACK:
                 contract = self.api.Contracts.Stocks[code]
                 if self.check_slippage_safe(contract):
-                    reason = f"移動止盈（高點 {pos.max_price}，回吐 {pullback:.2%}，獲利 {profit:.2%}）"
+                    reason = f"移動止盈（高點{pos.max_price}，回吐{pullback:.2%}，獲利{profit:.2%}）"
 
             if reason:
                 self._execute_exit(code, current, reason)
@@ -525,12 +681,50 @@ class AITradingBot:
 
         self._place_odd_order(contract, price, qty, sj.constant.Action.Sell)
         profit_pct = pos.profit_pct(price)
+        net_pnl    = (price - pos.entry_price) * qty * (1 - TRADE_COST_PCT)
+        self._trade_log("SELL", pos, price, reason=reason)   # 2.3
         del self.positions[code]
         send_notify(
             f"[賣出] {code}  {reason}\n"
             f"賣出價: {price}  獲利: {profit_pct:+.2%}\n"
-            f"成本: {pos.entry_price}  數量: {qty} 股"
+            f"成本: {pos.entry_price}  數量: {qty} 股\n"
+            f"淨損益: {net_pnl:+.0f} 元"
         )
+
+    # ------------------------------------------------------------------
+    # 2.3 績效日誌：每筆進出場寫入 logs/trades_YYYYMMDD.csv
+    # ------------------------------------------------------------------
+    def _trade_log(self, action: str, pos: "Position", price: float, reason: str = "") -> None:
+        import csv, pathlib
+        log_dir = pathlib.Path("logs")
+        log_dir.mkdir(exist_ok=True)
+        today   = now_tw().strftime("%Y%m%d")
+        fpath   = log_dir / f"trades_{today}.csv"
+        is_new  = not fpath.exists()
+        net_pnl = (price - pos.entry_price) * pos.qty * (1 - TRADE_COST_PCT) if action == "SELL" else 0.0
+        row = {
+            "timestamp":    now_tw().strftime("%Y-%m-%d %H:%M:%S"),
+            "action":       action,
+            "code":         pos.code,
+            "price":        price,
+            "qty":          pos.qty,
+            "entry_price":  pos.entry_price,
+            "stop_price":   round(pos.stop_price, 2),
+            "trail_price":  round(pos.trail_price, 2),
+            "atr":          round(pos.atr, 2),
+            "entry_score":  round(pos.entry_score, 2),
+            "entry_rsi":    round(pos.entry_rsi, 1),
+            "entry_vwap":   round(pos.entry_vwap, 2),
+            "entry_chips":  pos.entry_chips,
+            "net_pnl":      round(net_pnl, 0),
+            "reason":       reason,
+        }
+        with open(fpath, "a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=list(row.keys()))
+            if is_new:
+                writer.writeheader()
+            writer.writerow(row)
+        print(f"[日誌] {action} {pos.code} @ {price}  寫入 {fpath}")
 
     # ------------------------------------------------------------------
     # 零股下單
@@ -684,25 +878,55 @@ if __name__ == "__main__":
                     time.sleep(SCAN_INTERVAL)
                     continue
 
-                # 市場情緒分析（每輪一次，覆蓋所有標的）
-                news_text = market_agg.fetch_headlines(limit=10)
-                if not news_text:
-                    print("[新聞] 無法取得今日新聞，跳過本輪。")
-                    time.sleep(SCAN_INTERVAL)
-                    continue
+                # 市場情緒分析（可透過 SENTIMENT_ENABLED 開關控制）
+                if SENTIMENT_ENABLED:
+                    news_text = market_agg.fetch_headlines(limit=10)
+                    if not news_text:
+                        print("[新聞] 無法取得今日新聞，跳過本輪。")
+                        time.sleep(SCAN_INTERVAL)
+                        continue
 
-                score, analysis = get_ai_sentiment(news_text)
-                print(f"[AI] 市場情緒 {score:+.2f}  {sentiment_label(score)}  {analysis}")
-                send_notify(
-                    f"[AI 市場情緒] {now.strftime('%H:%M')}\n"
-                    f"分數：{score:+.2f}  {sentiment_label(score)}\n"
-                    f"摘要：{analysis}"
-                )
+                    raw_score, analysis = get_ai_sentiment(news_text)
+                    score = bot.smooth_sentiment(raw_score)   # 1.1 情緒平滑
+                    print(f"[AI] 市場情緒 {score:+.2f}  {sentiment_label(score)}  {analysis}")
+                    send_notify(
+                        f"[AI 市場情緒] {now.strftime('%H:%M')}\n"
+                        f"分數：{score:+.2f}  {sentiment_label(score)}\n"
+                        f"摘要：{analysis}"
+                    )
+                else:
+                    score    = 1.0   # 情緒關閉時視為中性偏多，直接進入策略掃描
+                    analysis = "（情緒分析已關閉）"
+                    print(f"[AI] 情緒分析已停用，以預設分數 {score:+.2f} 執行策略。")
 
                 if score > 0.6:
-                    # 對漏斗精選清單每支股票掃描進場條件
-                    for code in bot.watch_list:
-                        bot.scan_and_buy(code, score, analysis)
+                    # 3.2 多策略框架：依市場狀態決定策略比重
+                    alloc = bot.allocator.allocate()
+                    print(f"[策略] {alloc.describe()}")
+                    send_notify(
+                        f"[策略配置] {alloc.regime.value}\n"
+                        f"波動率：{alloc.vol_ann:.1%}\n"
+                        f"動能：{alloc.momentum_budget_pct:.0%}  均值回歸：{alloc.mean_reversion_budget_pct:.0%}"
+                    )
+
+                    if alloc.regime == MarketRegime.RANGING:
+                        # 盤整市：優先執行均值回歸，動能策略次之
+                        print("[策略] 盤整市 → 均值回歸優先")
+                        for code in bot.watch_list:
+                            bot.scan_mean_reversion(code, score, analysis)
+                        # 仍保留部份動能策略（若有剩餘預算）
+                        if len(bot.positions) < MAX_POSITIONS:
+                            for code in bot.watch_list:
+                                bot.scan_and_buy(code, score, analysis)
+                    else:
+                        # 趨勢市（TRENDING / UNKNOWN）：動能策略為主
+                        print(f"[策略] {'趨勢市' if alloc.regime == MarketRegime.TRENDING else '未知狀態'} → 動能策略為主")
+                        for code in bot.watch_list:
+                            bot.scan_and_buy(code, score, analysis)
+                        # 均值回歸補充（若有剩餘預算）
+                        if len(bot.positions) < MAX_POSITIONS:
+                            for code in bot.watch_list:
+                                bot.scan_mean_reversion(code, score, analysis)
                 else:
                     print(f"[策略] 市場情緒不足（{score:.2f}），不進場。")
 
