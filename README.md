@@ -142,7 +142,7 @@ python main.py
 09:21 – 13:25  每 60 秒主循環
   ├─ [常駐] 出場監控
   ├─ [A] 大盤過濾（0050 > MA20）
-  ├─ [B] 市場情緒分析（GPT-4o，每輪一次）→ 推播 Telegram
+  ├─ [B] 市場情緒分析（GPT-4o，每輪一次）→ 推播 Telegram（SENTIMENT_ENABLED=False 時跳過）
   └─ [C] 進場掃描（對漏斗精選清單）
            ├─ 已持有 / 部位已滿 → 跳過
            ├─ 滑點保護 (Ask-Bid)/Bid > 0.5% → 跳過
@@ -191,7 +191,8 @@ python main.py
 | `FUNNEL_SCAN_HOUR/MINUTE` | 09:20 | 漏斗掃描觸發時間 |
 | `FUNNEL_MAX_RESULTS` | 5 | 漏斗精選最大標的數 |
 | `PINNED_STOCKS` | `("2330",)` | 固定監控標的（不受漏斗掃描影響，永遠包含在監控清單中） |
-| AI 進場門檻 | 0.6 | GPT-4o 分數須高於此值才進場 |
+| `SENTIMENT_ENABLED` | `True` | 情緒評分開關：`False` → 跳過 AI 新聞分析，直接進入策略掃描（節省 OpenAI 費用） |
+| AI 進場門檻 | 0.6 | GPT-4o 分數須高於此值才進場（`SENTIMENT_ENABLED=False` 時固定視為通過） |
 | 大盤均線 | 20 日 MA | 以 0050 ETF 代表大盤趨勢 |
 
 ---
@@ -288,6 +289,7 @@ SCAN_INTERVAL     = 60      # 掃描間隔（秒）
 FUNNEL_SCAN_HOUR   = 9      # 漏斗掃描觸發時（09:20）
 FUNNEL_SCAN_MINUTE = 20
 FUNNEL_MAX_RESULTS = 5      # 精選上限
+SENTIMENT_ENABLED  = True   # 情緒評分開關（False → 跳過 AI 分析）
 ```
 
 修改 `src/ai_trade/scanner.py` 頂部調整篩選條件：
@@ -458,7 +460,7 @@ base64 -w 0 sinopac.pfx          # Linux（複製輸出）
 - **連線限制** — 同一帳號最多 5 條同時連線，避免短時間重複啟動
 - **流量限制** — 市場資料每 5 秒最多 50 筆請求；委託每 10 秒最多 250 筆
 - **交易時間** — 盤中零股僅限 09:05–13:25，程式已自動判斷
-- **OpenAI 費用** — 每分鐘一次 GPT-4o 呼叫，交易時段約 250 次/日，建議設定 API 用量上限
+- **OpenAI 費用** — 每分鐘一次 GPT-4o 呼叫，交易時段約 250 次/日，建議設定 API 用量上限；將 `SENTIMENT_ENABLED = False` 可完全停用 AI 分析以節省費用
 
 ---
 

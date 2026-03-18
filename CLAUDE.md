@@ -98,6 +98,17 @@ api.logout()
 | Orders     | 250 req / 10s        |
 | Subscriptions | max 200 active    |
 
+## Key Bot Parameters (bot.py)
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `SENTIMENT_ENABLED` | `True` | Toggle AI news sentiment analysis. Set `False` to skip OpenAI calls and use a fixed score of `1.0`, saving API costs. |
+| `TOTAL_BUDGET` | 45,000 | Total capital in TWD |
+| `MAX_POSITIONS` | 3 | Max concurrent positions |
+| `STOP_LOSS_PCT` | 0.02 | Hard stop-loss threshold |
+| `TRAILING_START` | 0.015 | Trailing stop activation profit |
+| `TRAILING_PULLBACK` | 0.01 | Trailing stop pullback trigger |
+
 ## Development Rules
 
 - Always use `simulation=True` during development
