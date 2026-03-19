@@ -45,7 +45,7 @@ def detect_regime(api, lookback_days: int = 60) -> tuple[MarketRegime, float]:
     try:
         contract = api.Contracts.Stocks["0050"]
         kbars = api.kbars(contract, start=start, end=end)
-        df = pd.DataFrame({**kbars.dict()}).sort_values("ts")
+        df = pd.DataFrame({**kbars.model_dump()}).sort_values("ts")
         if len(df) < 10:
             return MarketRegime.UNKNOWN, 0.0
 

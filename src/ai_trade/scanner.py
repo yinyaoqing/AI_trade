@@ -109,7 +109,7 @@ class FunnelScanner:
             try:
                 contract = self.api.Contracts.Stocks[code]
                 kbars = self.api.kbars(contract, start=five_days_ago, end=today)
-                df = pd.DataFrame({**kbars.dict()})
+                df = pd.DataFrame({**kbars.model_dump()})
                 if df.empty:
                     continue
                 avg_vol    = df["Volume"].tail(5).mean() / 1000  # 張
@@ -175,12 +175,12 @@ class FunnelScanner:
 
                     # 昨日全天成交量
                     kbars_yd = self.api.kbars(contract, start=yesterday, end=yesterday)
-                    df_yd = pd.DataFrame({**kbars_yd.dict()})
+                    df_yd = pd.DataFrame({**kbars_yd.model_dump()})
                     yd_total_vol = df_yd["Volume"].sum() if not df_yd.empty else 0
 
                     # 今日 tick 資料
                     ticks = self.api.ticks(contract, date=today)
-                    df_tk = pd.DataFrame({**ticks.dict()})
+                    df_tk = pd.DataFrame({**ticks.model_dump()})
                     if df_tk.empty:
                         continue
                     df_tk["datetime"] = pd.to_datetime(df_tk["ts"])
