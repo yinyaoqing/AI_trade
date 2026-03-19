@@ -683,7 +683,10 @@ class AITradingBot:
         except Exception:
             qty = pos.qty
 
-        self._place_odd_order(contract, price, qty, sj.constant.Action.Sell)
+        ok = self._place_odd_order(contract, price, qty, sj.constant.Action.Sell)
+        if not ok:
+            print(f"[警告] {code} 賣單被拒，部位保留，下輪繼續監控。")
+            return
         profit_pct = pos.profit_pct(price)
         net_pnl    = (price - pos.entry_price) * qty * (1 - TRADE_COST_PCT)
         self._trade_log("SELL", pos, price, reason=reason)   # 2.3
@@ -733,7 +736,8 @@ class AITradingBot:
     # ------------------------------------------------------------------
     # 零股下單
     # ------------------------------------------------------------------
-    def _place_odd_order(self, contract, price: float, qty: int, action) -> None:
+    def _place_odd_order(self, contract, price: float, qty: int, action) -> bool:
+        """回傳 True 表示下單成功（op_code == '00'），False 表示交易所拒單"""
         order = self.api.Order(
             price=price,
             quantity=qty,
@@ -744,7 +748,11 @@ class AITradingBot:
             account=self.api.stock_account,
         )
         trade = self.api.place_order(contract, order)
-        print(f"[下單] {action} {contract.code} x{qty} @ {price}  狀態: {trade.status.status}")
+        op_code = getattr(getattr(trade, "operation", None), "op_code", "00")
+        ok = (op_code == "00")
+        status_str = trade.status.status if ok else f"拒單(op_code={op_code})"
+        print(f"[下單] {action} {contract.code} x{qty} @ {price}  狀態: {status_str}")
+        return ok
 
     def daily_summary(self) -> str:
         """產生今日交易總結，包含成交紀錄、損益與持倉狀況"""
@@ -753,7 +761,7 @@ class AITradingBot:
 
         # 成交紀錄
         try:
-            trades = self.api.list_trades(self.api.stock_account)
+            trades = self.api.list_trades()
             today  = now_tw().strftime("%Y-%m-%d")
             today_trades = [
                 t for t in (trades or [])
@@ -920,7 +928,7 @@ if __name__ == "__main__":
                         # 盤整市：優先執行均值回歸，動能策略次之
                         print("[策略] 盤整市 → 均值回歸優先")
                         for code in bot.watch_list:
-                            bot.scan_mean_reversion(code, score, analysis)
+                            bot.scan_mean_reversion(code, POSITION_SIZE * alloc.mean_reversion_budget_pct)
                         # 仍保留部份動能策略（若有剩餘預算）
                         if len(bot.positions) < MAX_POSITIONS:
                             for code in bot.watch_list:
