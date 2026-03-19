@@ -1,0 +1,31 @@
+{
+  "version": "0.2",
+  "language": "en",
+  "words": [
+    "yfinance",
+    "shioaji",
+    "Shioaji",
+    "VWAP",
+    "RVOL",
+    "MULT",
+    "backtest",
+    "feedparser",
+    "beautifulsoup",
+    "pandas",
+    "pyproject",
+    "toml",
+    "TWSE",
+    "sinopac",
+    "kbars",
+    "kbar",
+    "twstock",
+    "Cnyes",
+    "watchlist",
+    "annualised"
+  ],
+  "ignorePaths": [
+    ".env",
+    "*.pfx",
+    "uv.lock"
+  ]
+}

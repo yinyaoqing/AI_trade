@@ -1,10 +1,13 @@
 [project]
 name = "ai-trade"
 version = "0.1.0"
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 dependencies = [
     "shioaji>=1.2.0",
     "python-dotenv>=1.0.0",
+    "pandas>=2.0.0",
+    "pandas-ta>=0.3.14b",
+    "yfinance>=0.2.0",
 ]
 
 [project.optional-dependencies]
