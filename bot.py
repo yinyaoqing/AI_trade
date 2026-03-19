@@ -34,7 +34,7 @@ from src.ai_trade.news import NewsAggregator
 from src.ai_trade.scanner import FunnelScanner
 from src.ai_trade.chips import chips_sentiment, chips_summary           # 2.2 籌碼流向
 from src.ai_trade.strategy import (                                      # 3.2 多策略
-    StrategyAllocator, mean_reversion_signal, MarketRegime
+    StrategyAllocator, mean_reversion_signal, MarketRegime, AllocationResult
 )
 
 load_dotenv()
@@ -111,6 +111,29 @@ class Position:
 
     def profit_pct(self, current: float) -> float:
         return (current - self.entry_price) / self.entry_price
+
+
+@dataclass
+class BuyCandidate:
+    """掃描階段收集的候選進場標的，尚未下單"""
+    code:        str
+    strategy:    str    # "momentum" | "mean_reversion"
+    price:       float
+    qty:         int
+    vwap:        float
+    rsi:         float
+    chip_score:  float
+    atr_val:     float
+    stop_price:  float
+    trail_price: float
+    score:       float  # 排序依據：VWAP 突破幅度 × 0.5 + 法人情緒 × 0.5
+
+    def describe(self) -> str:
+        tag = "動能" if self.strategy == "momentum" else "均值回歸"
+        return (f"[候選/{tag}] {self.code}  "
+                f"價={self.price}  VWAP={self.vwap:.2f}  "
+                f"RSI={self.rsi:.1f}  法人={self.chip_score:+.2f}  "
+                f"綜合分={self.score:.3f}")
 
     def pullback_pct(self, current: float) -> float:
         return (self.max_price - current) / self.max_price
@@ -304,8 +327,27 @@ class AITradingBot:
         self.allocator = StrategyAllocator(self.api)                             # 3.2 多策略分配器
         self._last_regime: str = ""              # 策略配置上次推播的 regime，相同則不重複推播
 
+        # 查詢帳戶餘額，動態決定實際可用預算
+        self._init_budget()
+
         # 啟動時同步實際持倉
         self._sync_positions_from_api()
+
+    def _init_budget(self) -> None:
+        """查詢帳戶餘額，若小於 TOTAL_BUDGET 則以實際餘額為上限"""
+        global TOTAL_BUDGET, POSITION_SIZE, RISK_PER_TRADE
+        try:
+            bal = self.api.account_balance()
+            available = float(bal.acc_balance)
+            effective = min(available, TOTAL_BUDGET)
+            print(f"[預算] 帳戶餘額：{available:,.0f} 元  設定上限：{TOTAL_BUDGET:,} 元  → 實際預算：{effective:,.0f} 元")
+            if effective != TOTAL_BUDGET:
+                TOTAL_BUDGET  = effective
+                POSITION_SIZE = int(TOTAL_BUDGET // MAX_POSITIONS)
+                RISK_PER_TRADE = TOTAL_BUDGET * STOP_LOSS_PCT
+                print(f"[預算] 已調整 POSITION_SIZE={POSITION_SIZE:,} 元  RISK_PER_TRADE={RISK_PER_TRADE:,.0f} 元")
+        except Exception as e:
+            print(f"[預算] 查詢餘額失敗，沿用設定值 {TOTAL_BUDGET:,} 元：{e}")
 
     # ------------------------------------------------------------------
     # 持倉同步：將 API 實際持倉載入 self.positions
@@ -485,148 +527,218 @@ class AITradingBot:
             return False
 
     # ------------------------------------------------------------------
-    # 進場掃描（單一標的）
     # ------------------------------------------------------------------
-    def scan_and_buy(self, stock_code: str, score: float, analysis: str) -> None:
-        """通過市場情緒後，對單一標的執行 VWAP + 滑點檢查並進場"""
+    # 進場評估：掃描單一標的，回傳候選或 None（不下單）
+    # ------------------------------------------------------------------
+    def _eval_momentum(self, stock_code: str, sentiment_score: float) -> "BuyCandidate | None":
+        """評估動能策略進場條件（VWAP 突破 + RSI + 法人），不執行下單"""
         if stock_code in self.positions:
             print(f"[{stock_code}] 已持有，跳過。")
-            return
-        if len(self.positions) >= MAX_POSITIONS:
-            print(f"[{stock_code}] 部位已滿（{MAX_POSITIONS}），跳過。")
-            return
-
+            return None
         try:
             contract = self.api.Contracts.Stocks[stock_code]
-
-            # 滑點保護
             if not self.check_slippage_safe(contract):
-                return
+                return None
 
-            # VWAP + RSI（1.3）
             ticks = self.api.ticks(contract, date=now_tw().strftime("%Y-%m-%d"))
             df = ticks_to_df(ticks)
             vwap = ta.vwap(df["High"], df["Low"], df["Close"], df["Volume"]).iloc[-1]
             current_price = df["Close"].iloc[-1]
 
-            # 1.3 RSI 超買過濾：RSI ≥ 70 代表短期過熱，不追高
             rsi_series = ta.rsi(df["Close"], length=14)
             rsi = rsi_series.iloc[-1] if rsi_series is not None and not rsi_series.empty else float("nan")
-            if not pd.isna(rsi):
-                print(f"[{stock_code}] 現價={current_price}  VWAP={vwap:.2f}  RSI={rsi:.1f}")
-                if rsi >= RSI_OVERBOUGHT:
-                    print(f"[{stock_code}] RSI={rsi:.1f} 超買（≥{RSI_OVERBOUGHT}），不追高。")
-                    return
-            else:
-                print(f"[{stock_code}] 現價={current_price}  VWAP={vwap:.2f}  RSI=N/A（資料不足）")
+            rsi_val = float(rsi) if not pd.isna(rsi) else 50.0
 
+            print(f"[動能/{stock_code}] 現價={current_price}  VWAP={vwap:.2f}  RSI={rsi_val:.1f}")
+            if rsi_val >= RSI_OVERBOUGHT:
+                print(f"[動能/{stock_code}] RSI={rsi_val:.1f} 超買，跳過。")
+                return None
             if current_price <= vwap:
-                print(f"[{stock_code}] 現價未突破 VWAP，不進場。")
-                return
+                print(f"[動能/{stock_code}] 現價未突破 VWAP，跳過。")
+                return None
 
-            # 2.2 籌碼流向：法人合計賣超（score < -0.3）時不進場
             chip_score = chips_sentiment(stock_code)
-            print(f"  {chips_summary(stock_code)}  情緒分: {chip_score:+.2f}")
+            print(f"  {chips_summary(stock_code)}  法人分: {chip_score:+.2f}")
             if chip_score < -0.3:
-                print(f"[{stock_code}] 法人持續賣超（{chip_score:+.2f}），不進場。")
-                return
+                print(f"[動能/{stock_code}] 法人持續賣超，跳過。")
+                return None
 
-            # 1.2 ATR 動態部位
             qty = self.get_atr_qty(contract, current_price)
             if qty < 1:
-                print(f"[{stock_code}] 計算股數 < 1，跳過。")
-                return
+                return None
 
-            # 2.1 計算 ATR 自適應止損 / 移動止盈啟動價
             atr_val = 0.0
             try:
                 end_d   = now_tw().strftime("%Y-%m-%d")
                 start_d = (now_tw() - timedelta(days=60)).strftime("%Y-%m-%d")
-                kb = self.api.kbars(contract, start=start_d, end=end_d)
+                kb  = self.api.kbars(contract, start=start_d, end=end_d)
                 kdf = pd.DataFrame({**kb.dict()}).sort_values("ts")
-                atr_series = ta.atr(kdf["High"], kdf["Low"], kdf["Close"], length=14)
-                atr_val = float(atr_series.iloc[-1]) if atr_series is not None and not atr_series.empty else 0.0
+                atr_s = ta.atr(kdf["High"], kdf["Low"], kdf["Close"], length=14)
+                atr_val = float(atr_s.iloc[-1]) if atr_s is not None and not atr_s.empty else 0.0
             except Exception:
                 pass
 
             stop_p  = current_price - max(1.5 * atr_val, current_price * STOP_LOSS_PCT)
             trail_p = current_price + max(1.0 * atr_val, current_price * TRAILING_START)
 
-            self._place_odd_order(contract, current_price, qty, sj.constant.Action.Buy)
-            pos = Position(
-                code=stock_code,
-                entry_price=current_price,
-                qty=qty,
-                atr=atr_val,
-                stop_price=stop_p,
-                trail_price=trail_p,
-                entry_score=score,
-                entry_rsi=float(rsi) if not pd.isna(rsi) else 0.0,
-                entry_vwap=float(vwap),
-            )
-            self.positions[stock_code] = pos
-            self._trade_log("BUY", pos, current_price)   # 2.3
-            send_notify(
-                f"[買進] {stock_code}\n"
-                f"價格: {current_price}  數量: {qty} 股\n"
-                f"VWAP: {vwap:.2f}  RSI: {rsi:.1f}\n"
-                f"止損價: {stop_p:.2f}  止盈啟動: {trail_p:.2f}\n"
-                f"ATR: {atr_val:.2f}  情緒: {score:+.2f}  {analysis}"
+            # 綜合排序分：VWAP 突破幅度（50%）+ 法人情緒（50%）
+            vwap_gap   = (current_price - vwap) / vwap          # 0~正值
+            chip_norm  = (chip_score + 1) / 2                   # -1~1 → 0~1
+            rank_score = vwap_gap * 0.5 + chip_norm * 0.5
+
+            return BuyCandidate(
+                code=stock_code, strategy="momentum",
+                price=current_price, qty=qty,
+                vwap=float(vwap), rsi=rsi_val, chip_score=chip_score,
+                atr_val=atr_val, stop_price=stop_p, trail_price=trail_p,
+                score=rank_score,
             )
         except Exception as e:
-            print(f"[{stock_code}] 進場失敗: {e}")
+            print(f"[動能/{stock_code}] 評估失敗: {e}")
+            return None
 
-    # ------------------------------------------------------------------
-    # 出場監控：移動止盈 + 強制止損
-    # ------------------------------------------------------------------
-    # 3.2 均值回歸掃描（盤整市使用）
-    # ------------------------------------------------------------------
-    def scan_mean_reversion(self, stock_code: str, budget: float) -> None:
-        """RSI < 30 且現價 < VWAP 時買進，出場條件與動能策略相同"""
+    def _eval_mean_reversion(self, stock_code: str, budget: float) -> "BuyCandidate | None":
+        """評估均值回歸進場條件（RSI<30 + 現價<VWAP），不執行下單"""
         if stock_code in self.positions:
-            return
-        if len(self.positions) >= MAX_POSITIONS:
-            return
+            return None
         try:
             contract = self.api.Contracts.Stocks[stock_code]
             if not self.check_slippage_safe(contract):
-                return
+                return None
 
             ticks = self.api.ticks(contract, date=now_tw().strftime("%Y-%m-%d"))
             df    = ticks_to_df(ticks)
             sig   = mean_reversion_signal(df, stock_code)
 
-            print(f"[均值回歸] {stock_code}  {sig.reason}")
+            print(f"[均值回歸/{stock_code}]  {sig.reason}")
             if sig.action != "BUY":
-                return
+                return None
 
-            # 2.2 籌碼：法人大幅賣超仍跳過
             chip_score = chips_sentiment(stock_code)
             if chip_score < -0.5:
-                print(f"[均值回歸] {stock_code} 法人大幅賣超({chip_score:+.2f})，跳過。")
-                return
+                print(f"[均值回歸/{stock_code}] 法人大幅賣超，跳過。")
+                return None
 
             qty = max(int(budget / sig.current_price), 1)
-            self._place_odd_order(contract, sig.current_price, qty, sj.constant.Action.Buy)
-            pos = Position(
-                code=stock_code,
-                entry_price=sig.current_price,
-                qty=qty,
-                entry_score=0.0,
-                entry_rsi=sig.rsi,
-                entry_vwap=sig.vwap,
-                entry_chips=chip_score,
-            )
-            self.positions[stock_code] = pos
-            self._trade_log("BUY", pos, sig.current_price)
-            send_notify(
-                f"[均值回歸買進] {stock_code}\n"
-                f"價格: {sig.current_price}  數量: {qty} 股\n"
-                f"RSI: {sig.rsi}  VWAP: {sig.vwap}\n"
-                f"原因: {sig.reason}"
+            # 排序分：RSI 低於 30 的距離（越低越強）+ 法人情緒
+            rsi_gap   = max(30 - sig.rsi, 0) / 30               # 0~1
+            chip_norm = (chip_score + 1) / 2
+            rank_score = rsi_gap * 0.5 + chip_norm * 0.5
+
+            return BuyCandidate(
+                code=stock_code, strategy="mean_reversion",
+                price=sig.current_price, qty=qty,
+                vwap=sig.vwap, rsi=sig.rsi, chip_score=chip_score,
+                atr_val=0.0,
+                stop_price=sig.current_price * (1 - STOP_LOSS_PCT),
+                trail_price=sig.current_price * (1 + TRAILING_START),
+                score=rank_score,
             )
         except Exception as e:
-            print(f"[均值回歸] {stock_code} 失敗: {e}")
+            print(f"[均值回歸/{stock_code}] 評估失敗: {e}")
+            return None
+
+    def _execute_buy(self, c: "BuyCandidate", sentiment_score: float, analysis: str) -> None:
+        """對已通過評估的候選標的執行買進下單"""
+        contract = self.api.Contracts.Stocks[c.code]
+        ok = self._place_odd_order(contract, c.price, c.qty, sj.constant.Action.Buy)
+        if not ok:
+            print(f"[買進] {c.code} 下單被拒，跳過。")
+            return
+        pos = Position(
+            code=c.code,
+            entry_price=c.price,
+            qty=c.qty,
+            atr=c.atr_val,
+            stop_price=c.stop_price,
+            trail_price=c.trail_price,
+            entry_score=sentiment_score,
+            entry_rsi=c.rsi,
+            entry_vwap=c.vwap,
+            entry_chips=c.chip_score,
+        )
+        self.positions[c.code] = pos
+        self._trade_log("BUY", pos, c.price)
+        tag = "買進" if c.strategy == "momentum" else "均值回歸買進"
+        send_notify(
+            f"[{tag}] {c.code}\n"
+            f"價格: {c.price}  數量: {c.qty} 股\n"
+            f"VWAP: {c.vwap:.2f}  RSI: {c.rsi:.1f}  法人: {c.chip_score:+.2f}\n"
+            f"止損價: {c.stop_price:.2f}  止盈啟動: {c.trail_price:.2f}\n"
+            f"ATR: {c.atr_val:.2f}  情緒: {sentiment_score:+.2f}  {analysis}"
+        )
+
+    def scan_candidates(
+        self,
+        watch_list: list,
+        sentiment_score: float,
+        analysis: str,
+        alloc: "AllocationResult",
+    ) -> None:
+        """
+        全局候選掃描：
+        1. 對 watch_list 所有標的評估，收集通過條件的候選清單
+        2. 依綜合評分排序（高分優先）
+        3. 依序下單，直到部位滿為止
+        """
+        slots = MAX_POSITIONS - len(self.positions)
+        if slots <= 0:
+            return
+
+        from src.ai_trade.strategy import MarketRegime
+        candidates: list[BuyCandidate] = []
+
+        # ── 評估階段（全部掃完）──────────────────────────────────
+        for code in watch_list:
+            if code in self.positions:
+                print(f"[{code}] 已持有，跳過。")
+                continue
+            if alloc.regime == MarketRegime.RANGING:
+                mr_budget = POSITION_SIZE * alloc.mean_reversion_budget_pct
+                c = self._eval_mean_reversion(code, mr_budget)
+                if c:
+                    candidates.append(c)
+                # 盤整市仍允許動能策略作補充
+                c2 = self._eval_momentum(code, sentiment_score)
+                if c2:
+                    candidates.append(c2)
+            else:
+                c = self._eval_momentum(code, sentiment_score)
+                if c:
+                    candidates.append(c)
+                # 趨勢市也收集均值回歸作補充
+                mr_budget = POSITION_SIZE * alloc.mean_reversion_budget_pct
+                c2 = self._eval_mean_reversion(code, mr_budget)
+                if c2:
+                    candidates.append(c2)
+
+        if not candidates:
+            print("[掃描] 本輪無符合條件的候選標的。")
+            return
+
+        # ── 排序階段（綜合評分高分優先）──────────────────────────
+        # 同一股票若兩種策略都入選，只保留分數較高者
+        best: dict[str, BuyCandidate] = {}
+        for c in candidates:
+            if c.code not in best or c.score > best[c.code].score:
+                best[c.code] = c
+
+        ranked = sorted(best.values(), key=lambda x: x.score, reverse=True)
+        print(f"[掃描] 候選 {len(ranked)} 檔（排序後）：")
+        for c in ranked:
+            print(f"  {c.describe()}")
+
+        # ── 執行階段（高分優先，直到部位滿）──────────────────────
+        for c in ranked:
+            if len(self.positions) >= MAX_POSITIONS:
+                break
+            if c.code in self.positions:
+                continue
+            self._execute_buy(c, sentiment_score, analysis)
+
+    # ------------------------------------------------------------------
+    # 出場監控：移動止盈 + 強制止損
+    # ------------------------------------------------------------------
 
     # ------------------------------------------------------------------
     def monitor_exit(self) -> None:
