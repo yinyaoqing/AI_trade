@@ -152,7 +152,7 @@ class BacktestEngine:
     def _get_kbars(self, code: str, start: str, end: str) -> pd.DataFrame:
         contract = self.api.Contracts.Stocks[code]
         kbars = self.api.kbars(contract, start=start, end=end)
-        df = pd.DataFrame({**kbars.dict()})
+        df = pd.DataFrame({**kbars.model_dump()})
         df["date"] = pd.to_datetime(df["ts"]).dt.date.astype(str)
         df = df.drop_duplicates("date").sort_values("date").reset_index(drop=True)
         return df
