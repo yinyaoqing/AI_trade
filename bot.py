@@ -831,6 +831,11 @@ class AITradingBot:
             if pos is None:
                 continue
 
+            # 盤中零股規則：當日進場的部位 T+1 才能賣，跳過出場監控避免當沖
+            if pos.entry_time.date() == now_tw().date():
+                print(f"[監控] {code} 今日新建部位（零股 T+1），跳過當日出場。")
+                continue
+
             current = snap.close
             pos.update_max(current)
 
