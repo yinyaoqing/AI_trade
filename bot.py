@@ -129,6 +129,11 @@ class Position:
     def profit_pct(self, current: float) -> float:
         return (current - self.entry_price) / self.entry_price
 
+    def pullback_pct(self, current: float) -> float:
+        if self.max_price <= 0:
+            return 0.0
+        return (self.max_price - current) / self.max_price
+
 
 @dataclass
 class BuyCandidate:
@@ -356,6 +361,10 @@ class AITradingBot:
         try:
             bal = self.api.account_balance()
             available = float(bal.acc_balance)
+            if available <= 0:
+                # 模擬帳戶不支援 account_balance，回傳 0，沿用設定值
+                print(f"[預算] 帳戶餘額查詢回傳 0（模擬帳戶限制），沿用設定值 {TOTAL_BUDGET:,} 元")
+                return
             effective = min(available, TOTAL_BUDGET)
             print(f"[預算] 帳戶餘額：{available:,.0f} 元  設定上限：{TOTAL_BUDGET:,} 元  → 實際預算：{effective:,.0f} 元")
             if effective != TOTAL_BUDGET:
@@ -964,7 +973,10 @@ class AITradingBot:
 
         # 成交紀錄
         try:
-            trades = self.api.list_trades(self.api.stock_account)
+            try:
+                trades = self.api.list_trades(self.api.stock_account)
+            except TypeError:
+                trades = self.api.list_trades()   # 模擬帳戶不接受 account 參數
             today  = now_tw().strftime("%Y-%m-%d")
             today_trades = [
                 t for t in (trades or [])
