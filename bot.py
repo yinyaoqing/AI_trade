@@ -48,12 +48,12 @@ MAX_POSITIONS     = 3       # 最多同時持有部位數
 POSITION_SIZE     = TOTAL_BUDGET // MAX_POSITIONS  # 每筆 15,000 元
 
 
-STOP_LOSS_PCT        = 0.025   # 強制止損：虧損 2.5%（回測驗證：2% 橫盤假止損過多，3% 最大回撤控制較優，折衷取 2.5%）
+STOP_LOSS_PCT        = 0.03   # 強制止損：虧損 3%（回測驗證：2% 橫盤假止損過多，3% 最大回撤控制較優，折衷取 2.5%）
 TRAILING_START       = 0.015   # 移動止盈啟動點：獲利達 1.5%
 TRAILING_PULLBACK    = 0.01    # 移動止盈觸發（ATR 不足時的保底固定回撤）
 TRAILING_ATR_MULT    = 0.6     # 動態回撤：從最高點回落 0.6×ATR 時出場（ATR 夠大時優先）
 BREAKEVEN_TRIGGER    = 0.02    # 成本保衛：獲利達 2% 時自動將止損上移至成本價
-TIME_STOP_MINUTES    = 30      # 時間停損：進場後 X 分鐘仍在成本區則主動出場
+TIME_STOP_MINUTES    = 0      # 時間停損：進場後 X 分鐘仍在成本區則主動出場
 TIME_STOP_BAND       = 0.005   # 成本區定義：距進場價 ±0.5% 以內視為「原地踏步」
 SLIPPAGE_LIMIT       = 0.01    # 滑點保護：買賣價差 > 1%（零股市場天生價差較大，原 0.5% 過嚴）
 MIN_ORDER_VALUE      = 10_000  # 最小下單金額（元）：確保手續費占比 < 0.1%，避免最低手續費侵蝕獲利
@@ -104,6 +104,15 @@ PINNED_STOCKS: tuple[str, ...] = (
     "2357",   # ★★ 華碩   PF=1.28 Sharpe=1.35（0050成分）
     "2379",   # ★★ 瑞昱   PF=1.13 Sharpe=0.63（0050成分）
 )
+
+# 長期持有清單：列在此處的股票不納入止損/止盈監控，由人工決定出場時機
+# 適合基本面持股、核心持倉等不希望被短期波動觸發自動賣出的標的
+LONG_TERM_HOLD: frozenset[str] = frozenset([
+    "0050",   # ★★ 元大台灣50（長期核心持倉，包含台積電等優質藍籌）
+    # 範例：
+    # "2330",   # 台積電（長期核心持倉）
+    # "0050",   # 元大台灣50
+])
 
 openai_client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 tg_token   = os.environ.get("TELEGRAM_BOT_TOKEN", "")
@@ -947,6 +956,11 @@ class AITradingBot:
             code = snap.code
             pos = self.positions.get(code)
             if pos is None:
+                continue
+
+            # 長期持有清單：跳過所有自動出場監控，由人工決定
+            if code in LONG_TERM_HOLD:
+                print(f"[監控] {code} 為長期持有，跳過自動出場監控。")
                 continue
 
             # 盤中零股規則：當日進場的部位 T+1 才能賣，跳過出場監控避免當沖
