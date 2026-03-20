@@ -472,22 +472,38 @@ class AITradingBot:
         print(f"[報價訂閱] BidAsk 訂閱完成：成功 {subscribed} 檔，失敗 {failed} 檔")
 
     def _init_budget(self) -> None:
-        """查詢帳戶餘額，若小於 TOTAL_BUDGET 則以實際餘額為上限"""
+        """
+        查詢帳戶餘額，直接以實際餘額作為 TOTAL_BUDGET。
+        模擬帳戶回傳 0 時，沿用 bot.py 頂部的設定值。
+        """
         global TOTAL_BUDGET, POSITION_SIZE, RISK_PER_TRADE
         try:
             bal = self.api.account_balance()
             available = float(bal.acc_balance)
             if available <= 0:
                 # 模擬帳戶不支援 account_balance，回傳 0，沿用設定值
-                print(f"[預算] 帳戶餘額查詢回傳 0（模擬帳戶限制），沿用設定值 {TOTAL_BUDGET:,} 元")
+                print(f"[預算] 帳戶餘額回傳 0（模擬帳戶限制），沿用設定值 {TOTAL_BUDGET:,} 元")
                 return
-            effective = min(available, TOTAL_BUDGET)
-            print(f"[預算] 帳戶餘額：{available:,.0f} 元  設定上限：{TOTAL_BUDGET:,} 元  → 實際預算：{effective:,.0f} 元")
-            if effective != TOTAL_BUDGET:
-                TOTAL_BUDGET  = effective
-                POSITION_SIZE = int(TOTAL_BUDGET // MAX_POSITIONS)
-                RISK_PER_TRADE = TOTAL_BUDGET * STOP_LOSS_PCT
-                print(f"[預算] 已調整 POSITION_SIZE={POSITION_SIZE:,} 元  RISK_PER_TRADE={RISK_PER_TRADE:,.0f} 元")
+
+            TOTAL_BUDGET   = available
+            POSITION_SIZE  = int(TOTAL_BUDGET // MAX_POSITIONS)
+            RISK_PER_TRADE = TOTAL_BUDGET * STOP_LOSS_PCT
+            print(
+                f"[預算] 帳戶餘額：{available:,.0f} 元\n"
+                f"  → TOTAL_BUDGET={TOTAL_BUDGET:,.0f}  "
+                f"POSITION_SIZE={POSITION_SIZE:,}  "
+                f"RISK_PER_TRADE={RISK_PER_TRADE:,.0f}"
+            )
+
+            # 安全警告：單筆預算低於最小下單金額時無法進場
+            if POSITION_SIZE < MIN_ORDER_VALUE:
+                print(
+                    f"[預算] ⚠ 警告：單筆預算 {POSITION_SIZE:,} 元 < 最低下單 {MIN_ORDER_VALUE:,} 元，"
+                    f"所有進場評估都會被 MIN_ORDER_VALUE 擋下。\n"
+                    f"  建議：帳戶至少需要 {MIN_ORDER_VALUE * MAX_POSITIONS:,} 元，"
+                    f"或將 MAX_POSITIONS 降至 {int(TOTAL_BUDGET // MIN_ORDER_VALUE)}。"
+                )
+
         except Exception as e:
             print(f"[預算] 查詢餘額失敗，沿用設定值 {TOTAL_BUDGET:,} 元：{e}")
 
@@ -509,11 +525,14 @@ class AITradingBot:
                     continue  # 已有紀錄，不覆蓋
                 avg_price = getattr(p, "price", None) or getattr(p, "average_price", 0)
                 qty       = getattr(p, "quantity", 0)
-                self.positions[code] = Position(
+                pos = Position(
                     code=code,
                     entry_price=float(avg_price),
                     qty=int(qty),
                 )
+                # 同步進來的舊部位：entry_time 設為昨天，避免被 T+1 規則擋住出場
+                pos.entry_time = now_tw() - timedelta(days=1)
+                self.positions[code] = pos
                 last  = float(getattr(p, "last_price", avg_price) or avg_price)
                 pnl   = (last - float(avg_price)) * int(qty)
                 print(
@@ -1013,6 +1032,8 @@ class AITradingBot:
             f"成本: {pos.entry_price}  數量: {qty} 股\n"
             f"淨損益: {net_pnl:+.0f} 元"
         )
+        # 賣出後重新查詢帳戶餘額，更新 POSITION_SIZE 以反映實際損益
+        self._init_budget()
 
     # ------------------------------------------------------------------
     # 2.3 績效日誌：每筆進出場寫入 logs/trades_YYYYMMDD.csv
