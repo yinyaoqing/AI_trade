@@ -336,7 +336,8 @@ class AITradingBot:
     def __init__(self):
         _debug_env()
 
-        self.api = sj.Shioaji(simulation=True)
+        self._simulation = True   # ← 切換正式交易時改為 False
+        self.api = sj.Shioaji(simulation=self._simulation)
         print("[初始化] Shioaji 實例建立完成")
 
         # 清除環境變數中可能夾帶的空白、換行（GitHub Actions Secrets 常見問題）
@@ -1180,7 +1181,8 @@ if __name__ == "__main__":
     market_agg = NewsAggregator(stock_code="")
 
     print("=" * 55)
-    print("AI 模擬交易系統啟動（simulation=True）")
+    _mode = "simulation=True（模擬）" if bot._simulation else "simulation=False（正式交易⚠️）"
+    print(f"AI 交易系統啟動  模式：{_mode}")
     print(f"監控清單：{list(PINNED_STOCKS)}")
     print(f"最大部位：{MAX_POSITIONS}  單筆：{POSITION_SIZE:,} 元")
     print(f"止損：{STOP_LOSS_PCT:.0%}  移動止盈啟動：{TRAILING_START:.1%}  回吐：{TRAILING_PULLBACK:.1%}")
@@ -1201,7 +1203,7 @@ if __name__ == "__main__":
 
     send_notify(
         f"[AI Trade 啟動]\n"
-        f"模式：simulation=True\n"
+        f"模式：{'simulation=True（模擬）' if bot._simulation else 'simulation=False（正式交易⚠️）'}\n"
         f"部位上限：{MAX_POSITIONS} 檔 | 單筆：{POSITION_SIZE:,} 元\n"
         f"止損 {STOP_LOSS_PCT:.0%} | 移動止盈 {TRAILING_START:.1%}→{TRAILING_PULLBACK:.1%} | 滑點 {SLIPPAGE_LIMIT:.1%}\n"
         f"監控清單：{list(PINNED_STOCKS)}\n"
