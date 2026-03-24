@@ -43,8 +43,8 @@ load_dotenv()
 # 1. 參數設定
 # =============================================================================
 
-TOTAL_BUDGET      = 45000   # 總預算（元）
-MAX_POSITIONS     = 3       # 最多同時持有部位數
+TOTAL_BUDGET      = 26000   # 總預算（元）
+MAX_POSITIONS     = 2       # 最多同時持有部位數
 POSITION_SIZE     = TOTAL_BUDGET // MAX_POSITIONS  # 每筆 15,000 元
 
 
@@ -336,7 +336,7 @@ class AITradingBot:
     def __init__(self):
         _debug_env()
 
-        self._simulation = True   # ← 切換正式交易時改為 False
+        self._simulation = False   # ← 切換正式交易時改為 False
         self.api = sj.Shioaji(simulation=self._simulation)
         print("[初始化] Shioaji 實例建立完成")
 
