@@ -70,8 +70,10 @@ def _fetch_flow_for_date(date: str) -> dict[str, dict]:
                 continue
             code = row[0].strip()
 
-            def parse(val: str) -> int:
-                return int(val.replace(",", "").replace("+", "") or 0)
+            def parse(val) -> int:
+                if isinstance(val, (int, float)):
+                    return int(val)
+                return int(str(val).replace(",", "").replace("+", "") or 0)
 
             try:
                 result[code] = {

@@ -56,7 +56,7 @@ BREAKEVEN_TRIGGER    = 0.02    # 成本保衛：獲利達 2% 時自動將止損�
 TIME_STOP_MINUTES    = 0      # 時間停損：進場後 X 分鐘仍在成本區則主動出場
 TIME_STOP_BAND       = 0.005   # 成本區定義：距進場價 ±0.5% 以內視為「原地踏步」
 SLIPPAGE_LIMIT       = 0.01    # 滑點保護：買賣價差 > 1%（零股市場天生價差較大，原 0.5% 過嚴）
-MIN_ORDER_VALUE      = 10_000  # 最小下單金額（元）：確保手續費占比 < 0.1%，避免最低手續費侵蝕獲利
+MIN_ORDER_VALUE      = 9_000   # 最小下單金額（元）：確保手續費占比 < 0.1%，避免最低手續費侵蝕獲利
 
 # Phase 1 優化參數
 SENTIMENT_ENABLED  = False   # 新聞情緒評分開關：False → 跳過 AI 分析，直接進入策略掃描
@@ -775,9 +775,10 @@ class AITradingBot:
                     return None
 
             # 止損：ATR 止損與固定止損取較嚴格者（止損價較高 = 損失較小），防跳空打滑
+            # 再以 2.5% 為下限，避免 ATR 過小時止損空間不足 0.15% 造成假止損
             atr_stop_p = current_price - 1.5 * atr_val
             pct_stop_p = current_price * (1 - STOP_LOSS_PCT)
-            stop_p  = max(atr_stop_p, pct_stop_p)
+            stop_p  = min(max(atr_stop_p, pct_stop_p), current_price * 0.975)
             trail_p = current_price + max(1.0 * atr_val, current_price * TRAILING_START)
 
             # ── 綜合排序分：VWAP 突破幅度 40% + 法人情緒 40% + 量能 20%
