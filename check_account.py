@@ -89,6 +89,7 @@ def check_account() -> None:
     lines.append("")
 
     # ── 3. 帳戶餘額（現貨交割款）────────────────────────────────────
+    acc_balance: float | None = None
     try:
         bal = api.account_balance()
         acc_balance = float(bal.acc_balance)
@@ -104,7 +105,7 @@ def check_account() -> None:
 
     # ── 4. 目前持倉 ──────────────────────────────────────────────────
     try:
-        held = api.list_positions(stock_account)
+        held = api.list_positions(stock_account, unit=sj.constant.Unit.Share)
         if not held:
             lines.append("[持倉] 目前無持股")
         else:
@@ -127,7 +128,31 @@ def check_account() -> None:
     except Exception as e:
         lines.append(f"[持倉] 查詢失敗：{e}")
 
-    # ── 5. 輸出並推播 ─────────────────────────────────────────────────
+    # ── 5. 未交割明細 ─────────────────────────────────────────────────
+    lines.append("")
+    try:
+        settlements = api.settlements(stock_account)
+        if not settlements:
+            lines.append("[未交割] 目前無待交割款項")
+        else:
+            payable    = sum(s.amount for s in settlements if s.amount < 0)
+            receivable = sum(s.amount for s in settlements if s.amount > 0)
+            net        = payable + receivable
+            lines.append(f"[未交割] 共 {len(settlements)} 筆")
+            for s in settlements:
+                direction = "應付（買入）" if s.amount < 0 else "應收（賣出）"
+                lines.append(f"  {s.date}  T+{s.T}  {direction}  {s.amount:+,.0f} 元")
+            lines.append(f"  ────────────────────────────────")
+            lines.append(f"  應付合計：{payable:,.0f} 元")
+            lines.append(f"  應收合計：{receivable:+,.0f} 元")
+            lines.append(f"  淨額：{net:+,.0f} 元")
+            if acc_balance is not None:
+                safe = acc_balance + net
+                lines.append(f"  安全可動用現金（餘額＋淨額）：{safe:,.0f} 元")
+    except Exception as e:
+        lines.append(f"[未交割] 查詢失敗：{e}")
+
+    # ── 6. 輸出並推播 ─────────────────────────────────────────────────
     report = "\n".join(lines)
     print("\n" + report + "\n")
     send_telegram(report)

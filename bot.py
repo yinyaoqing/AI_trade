@@ -483,24 +483,42 @@ class AITradingBot:
 
     def _init_budget(self) -> None:
         """
-        查詢帳戶餘額，直接以實際餘額作為 TOTAL_BUDGET。
-        模擬帳戶回傳 0 時，沿用 bot.py 頂部的設定值。
+        以「安全可動用現金」作為 TOTAL_BUDGET：
+          安全可動用現金 = 交割款餘額 + 未交割淨額（應收 - 應付）
+        模擬帳戶不支援 account_balance，回傳 0 時沿用頂部設定值。
         """
         global TOTAL_BUDGET, POSITION_SIZE, RISK_PER_TRADE
         try:
             bal = self.api.account_balance()
-            available = float(bal.acc_balance)
-            if available <= 0:
+            acc_balance = float(bal.acc_balance)
+            if acc_balance <= 0:
                 # 模擬帳戶不支援 account_balance，回傳 0，沿用設定值
                 print(f"[預算] 帳戶餘額回傳 0（模擬帳戶限制），沿用設定值 {TOTAL_BUDGET:,} 元")
                 return
+
+            # 查詢未交割淨額
+            net_settlement = 0.0
+            try:
+                settlements = self.api.settlements(self.api.stock_account)
+                if settlements:
+                    payable    = sum(s.amount for s in settlements if s.amount < 0)
+                    receivable = sum(s.amount for s in settlements if s.amount > 0)
+                    net_settlement = payable + receivable
+                    print(
+                        f"[預算] 未交割：應付 {payable:,.0f} 元  應收 {receivable:+,.0f} 元  "
+                        f"淨額 {net_settlement:+,.0f} 元"
+                    )
+            except Exception as e:
+                print(f"[預算] 未交割查詢失敗，以 0 計算：{e}")
+
+            available = acc_balance + net_settlement
 
             TOTAL_BUDGET   = available
             POSITION_SIZE  = int(TOTAL_BUDGET // MAX_POSITIONS)
             RISK_PER_TRADE = TOTAL_BUDGET * STOP_LOSS_PCT
             print(
-                f"[預算] 帳戶餘額：{available:,.0f} 元\n"
-                f"  → TOTAL_BUDGET={TOTAL_BUDGET:,.0f}  "
+                f"[預算] 交割款餘額：{acc_balance:,.0f} 元  淨額：{net_settlement:+,.0f} 元\n"
+                f"  → 安全可動用現金 TOTAL_BUDGET={TOTAL_BUDGET:,.0f}  "
                 f"POSITION_SIZE={POSITION_SIZE:,}  "
                 f"RISK_PER_TRADE={RISK_PER_TRADE:,.0f}"
             )
@@ -523,7 +541,7 @@ class AITradingBot:
     def _sync_positions_from_api(self) -> None:
         """查詢券商實際持倉，載入 self.positions，避免重啟後遺漏持股"""
         try:
-            held = self.api.list_positions(self.api.stock_account)
+            held = self.api.list_positions(self.api.stock_account, unit=sj.constant.Unit.Share)
             if not held:
                 print("[持倉] 目前無持股")
                 return
@@ -555,7 +573,7 @@ class AITradingBot:
     def get_positions_summary(self) -> str:
         """回傳持倉摘要字串（供啟動通知與定時推播使用）"""
         try:
-            held = self.api.list_positions(self.api.stock_account)
+            held = self.api.list_positions(self.api.stock_account, unit=sj.constant.Unit.Share)
         except Exception as e:
             return f"（持倉查詢失敗: {e}）"
 
@@ -1028,7 +1046,7 @@ class AITradingBot:
         contract = self.api.Contracts.Stocks[code]
         # 查詢實際持倉數量
         try:
-            held = self.api.list_positions(self.api.stock_account)
+            held = self.api.list_positions(self.api.stock_account, unit=sj.constant.Unit.Share)
             hold = next((p for p in held if p.code == code), None)
             qty = hold.quantity if hold else pos.qty
         except Exception:
