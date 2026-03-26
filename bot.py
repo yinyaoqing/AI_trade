@@ -481,11 +481,12 @@ class AITradingBot:
                 failed += 1
         print(f"[報價訂閱] BidAsk 訂閱完成：成功 {subscribed} 檔，失敗 {failed} 檔")
 
-    def _init_budget(self) -> None:
+    def _init_budget(self, notify: bool = False) -> None:
         """
         以「安全可動用現金」作為 TOTAL_BUDGET：
           安全可動用現金 = 交割款餘額 + 未交割淨額（應收 - 應付）
         模擬帳戶不支援 account_balance，回傳 0 時沿用頂部設定值。
+        notify=True 時將結果推播至 Telegram（定期更新時使用）。
         """
         global TOTAL_BUDGET, POSITION_SIZE, RISK_PER_TRADE
         try:
@@ -498,12 +499,17 @@ class AITradingBot:
 
             # 查詢未交割淨額
             net_settlement = 0.0
+            payable = receivable = 0.0
+            settlement_lines: list[str] = []
             try:
                 settlements = self.api.settlements(self.api.stock_account)
                 if settlements:
                     payable    = sum(s.amount for s in settlements if s.amount < 0)
                     receivable = sum(s.amount for s in settlements if s.amount > 0)
                     net_settlement = payable + receivable
+                    for s in settlements:
+                        direction = "應付" if s.amount < 0 else "應收"
+                        settlement_lines.append(f"  {s.date} T+{s.T} {direction} {s.amount:+,.0f} 元")
                     print(
                         f"[預算] 未交割：應付 {payable:,.0f} 元  應收 {receivable:+,.0f} 元  "
                         f"淨額 {net_settlement:+,.0f} 元"
@@ -524,13 +530,27 @@ class AITradingBot:
             )
 
             # 安全警告：單筆預算低於最小下單金額時無法進場
+            warn_msg = ""
             if POSITION_SIZE < MIN_ORDER_VALUE:
-                print(
-                    f"[預算] ⚠ 警告：單筆預算 {POSITION_SIZE:,} 元 < 最低下單 {MIN_ORDER_VALUE:,} 元，"
-                    f"所有進場評估都會被 MIN_ORDER_VALUE 擋下。\n"
-                    f"  建議：帳戶至少需要 {MIN_ORDER_VALUE * MAX_POSITIONS:,} 元，"
-                    f"或將 MAX_POSITIONS 降至 {int(TOTAL_BUDGET // MIN_ORDER_VALUE)}。"
+                warn_msg = (
+                    f"\n⚠️ 單筆預算 {POSITION_SIZE:,} 元 < 最低下單 {MIN_ORDER_VALUE:,} 元，無法進場。"
+                    f"\n建議帳戶至少 {MIN_ORDER_VALUE * MAX_POSITIONS:,} 元，"
+                    f"或 MAX_POSITIONS 降至 {int(TOTAL_BUDGET // MIN_ORDER_VALUE)}。"
                 )
+                print(f"[預算] {warn_msg}")
+
+            if notify:
+                msg = (
+                    f"[預算更新] {now_tw().strftime('%H:%M:%S')}\n"
+                    f"交割款餘額：{acc_balance:,.0f} 元\n"
+                    f"未交割明細：\n" + ("\n".join(settlement_lines) if settlement_lines else "  （無待交割）") + "\n"
+                    f"應付：{payable:,.0f} 元  應收：{receivable:+,.0f} 元  淨額：{net_settlement:+,.0f} 元\n"
+                    f"─────────────────────\n"
+                    f"安全可動用現金：{TOTAL_BUDGET:,.0f} 元\n"
+                    f"單筆上限：{POSITION_SIZE:,} 元"
+                    + warn_msg
+                )
+                send_notify(msg)
 
         except Exception as e:
             print(f"[預算] 查詢餘額失敗，沿用設定值 {TOTAL_BUDGET:,} 元：{e}")
@@ -1066,8 +1086,6 @@ class AITradingBot:
             f"成本: {pos.entry_price}  數量: {qty} 股\n"
             f"淨損益: {net_pnl:+.0f} 元"
         )
-        # 賣出後重新查詢帳戶餘額，更新 POSITION_SIZE 以反映實際損益
-        self._init_budget()
 
     # ------------------------------------------------------------------
     # 2.3 績效日誌：每筆進出場寫入 logs/trades_YYYYMMDD.csv
@@ -1234,6 +1252,8 @@ if __name__ == "__main__":
     )
 
     last_digest_sent: float = time.time()
+    last_budget_refresh: float = time.time()
+    BUDGET_REFRESH_INTERVAL = 600   # 每 10 分鐘重查 settlements() 更新預算
 
     try:
         while True:
@@ -1246,6 +1266,11 @@ if __name__ == "__main__":
 
             if in_market:
                 print(f"\n[{now.strftime('%H:%M:%S')} CST] 交易時間掃描  部位：{list(bot.positions.keys()) or '無'}")
+
+                # 定期重查 settlements()，確保賣出應收款及時反映至 TOTAL_BUDGET
+                if time.time() - last_budget_refresh >= BUDGET_REFRESH_INTERVAL:
+                    bot._init_budget(notify=True)
+                    last_budget_refresh = time.time()
 
                 # 出場監控（每輪必跑，不受任何過濾影響）
                 bot.monitor_exit()
