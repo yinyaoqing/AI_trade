@@ -45,7 +45,7 @@ load_dotenv()
 
 TOTAL_BUDGET      = 26000   # 總預算（元）
 MAX_POSITIONS     = 2       # 最多同時持有部位數
-POSITION_SIZE     = TOTAL_BUDGET // MAX_POSITIONS  # 每筆 15,000 元
+POSITION_SIZE     = TOTAL_BUDGET // MAX_POSITIONS  # 初始值，MIN_ORDER_VALUE 定義後由 _calc_position_size() 修正
 
 
 STOP_LOSS_PCT        = 0.03   # 強制止損：虧損 3%（回測驗證：2% 橫盤假止損過多，3% 最大回撤控制較優，折衷取 2.5%）
@@ -57,6 +57,32 @@ TIME_STOP_MINUTES    = 0      # 時間停損：進場後 X 分鐘仍在成本區
 TIME_STOP_BAND       = 0.005   # 成本區定義：距進場價 ±0.5% 以內視為「原地踏步」
 SLIPPAGE_LIMIT       = 0.01    # 滑點保護：買賣價差 > 1%（零股市場天生價差較大，原 0.5% 過嚴）
 MIN_ORDER_VALUE      = 9_000   # 最小下單金額（元）：確保手續費占比 < 0.1%，避免最低手續費侵蝕獲利
+
+
+def _calc_position_size(total_budget: float) -> int:
+    """
+    計算單筆可用預算，依實際可承接部位數動態退化：
+
+      affordable       = total_budget // MIN_ORDER_VALUE  （預算最多能開幾個有效部位）
+      effective_positions = min(affordable, MAX_POSITIONS)
+
+      effective > 0 → POSITION_SIZE = total_budget // effective_positions
+      effective = 0 → 回傳原始值（< MIN_ORDER_VALUE，進場時會被擋下）
+
+    範例（MIN_ORDER_VALUE=9,000）：
+      30,000 / MAX_POS=3 → affordable=3, effective=3, size=10,000
+      20,000 / MAX_POS=3 → affordable=2, effective=2, size=10,000
+      12,000 / MAX_POS=3 → affordable=1, effective=1, size=12,000
+       8,000 / MAX_POS=3 → affordable=0, blocked
+    """
+    affordable          = int(total_budget // MIN_ORDER_VALUE)
+    effective_positions = min(affordable, MAX_POSITIONS)
+    if effective_positions <= 0:
+        return int(total_budget // MAX_POSITIONS)   # < MIN_ORDER_VALUE，進場時自動擋下
+    return int(total_budget // effective_positions)
+
+
+POSITION_SIZE = _calc_position_size(TOTAL_BUDGET)
 
 # Phase 1 優化參數
 SENTIMENT_ENABLED  = False   # 新聞情緒評分開關：False → 跳過 AI 分析，直接進入策略掃描
@@ -520,7 +546,7 @@ class AITradingBot:
             available = acc_balance + net_settlement
 
             TOTAL_BUDGET   = available
-            POSITION_SIZE  = int(TOTAL_BUDGET // MAX_POSITIONS)
+            POSITION_SIZE  = _calc_position_size(TOTAL_BUDGET)
             RISK_PER_TRADE = TOTAL_BUDGET * STOP_LOSS_PCT
             print(
                 f"[預算] 交割款餘額：{acc_balance:,.0f} 元  淨額：{net_settlement:+,.0f} 元\n"
@@ -534,8 +560,7 @@ class AITradingBot:
             if POSITION_SIZE < MIN_ORDER_VALUE:
                 warn_msg = (
                     f"\n⚠️ 單筆預算 {POSITION_SIZE:,} 元 < 最低下單 {MIN_ORDER_VALUE:,} 元，無法進場。"
-                    f"\n建議帳戶至少 {MIN_ORDER_VALUE * MAX_POSITIONS:,} 元，"
-                    f"或 MAX_POSITIONS 降至 {int(TOTAL_BUDGET // MIN_ORDER_VALUE)}。"
+                    f"\n建議帳戶至少 {MIN_ORDER_VALUE * MAX_POSITIONS:,} 元。"
                 )
                 print(f"[預算] {warn_msg}")
 
