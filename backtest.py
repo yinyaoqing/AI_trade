@@ -37,7 +37,7 @@ load_dotenv()
 TZ_TW = timezone(timedelta(hours=8))
 
 # ── 回測參數（與 bot.py 一致）────────────────────────────
-STOP_LOSS_PCT     = 0.025    # 與 bot.py 一致（2.5%）
+STOP_LOSS_PCT     = 0.03     # 3%
 TRAILING_START    = 0.015
 TRAILING_PULLBACK = 0.01
 TRAILING_ATR_MULT = 0.6      # 動態回撤：0.6×ATR（與 bot.py 一致）
