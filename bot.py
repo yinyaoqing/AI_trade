@@ -50,7 +50,7 @@ POSITION_SIZE     = TOTAL_BUDGET // MAX_POSITIONS  # 初始值，MIN_ORDER_VALUE
 
 STOP_LOSS_PCT        = 0.03   # 強制止損：虧損 3%（回測驗證：2% 橫盤假止損過多，3% 最大回撤控制較優，折衷取 2.5%）
 TRAILING_START       = 0.015   # 移動止盈啟動點：獲利達 1.5%
-TRAILING_PULLBACK    = 0.01    # 移動止盈觸發（ATR 不足時的保底固定回撤）
+TRAILING_PULLBACK    = 0.015    # 移動止盈觸發（ATR 不足時的保底固定回撤）
 TRAILING_ATR_MULT    = 0.6     # 動態回撤：從最高點回落 0.6×ATR 時出場（ATR 夠大時優先）
 BREAKEVEN_TRIGGER    = 0.02    # 成本保衛：獲利達 2% 時自動將止損上移至成本價
 TIME_STOP_MINUTES    = 0      # 時間停損：進場後 X 分鐘仍在成本區則主動出場
@@ -400,6 +400,7 @@ class AITradingBot:
         self._sentiment_scores: deque[float] = deque(maxlen=SENTIMENT_SMOOTH_N)  # 1.1 情緒平滑
         self.allocator = StrategyAllocator(self.api)                             # 3.2 多策略分配器
         self._last_regime: str = ""              # 策略配置上次推播的 regime，相同則不重複推播
+        self._market_trend_up: bool = False      # 大盤趨勢狀態（含遲滯帶）
         self.funnel = FunnelScanner(self.api, get_ai_sentiment)                  # 漏斗掃描器
         self._funnel_done_today: bool = False    # 當日是否已執行漏斗掃描
 
@@ -699,7 +700,11 @@ class AITradingBot:
     # 大盤趨勢過濾
     # ------------------------------------------------------------------
     def check_market_trend(self) -> bool:
-        """0050 收盤價是否在 20 日均線之上"""
+        """
+        0050 收盤價是否在 20 日均線之上（含遲滯帶防抖動）。
+        突破 MA20×1.001 → 轉多；跌破 MA20×0.999 → 轉空。
+        介於之間維持上次判斷，避免每分鐘翻轉。
+        """
         try:
             contract = self.api.Contracts.Stocks[MARKET_INDEX]
             kbars = self.api.kbars(
@@ -710,9 +715,17 @@ class AITradingBot:
             df = pd.DataFrame({**kbars.model_dump()}).set_index("ts").sort_index()
             ma20 = df["Close"].rolling(20).mean().iloc[-1]
             current = df["Close"].iloc[-1]
-            label = "趨勢向上" if current > ma20 else "趨勢偏弱"
+
+            HYST = 0.001  # 遲滯帶 0.1%
+            if current > ma20 * (1 + HYST):
+                self._market_trend_up = True
+            elif current < ma20 * (1 - HYST):
+                self._market_trend_up = False
+            # else: 維持 self._market_trend_up 上次值
+
+            label = "趨勢向上" if self._market_trend_up else "趨勢偏弱"
             print(f"[大盤] 0050={current:.2f}  MA20={ma20:.2f}  {label}")
-            return current > ma20
+            return self._market_trend_up
         except Exception as e:
             print(f"[大盤] 取得失敗: {e}")
             return False
@@ -1318,6 +1331,12 @@ if __name__ == "__main__":
 
                 # 漏斗掃描（09:20 每日一次，更新當日監控清單）
                 bot.run_funnel_if_needed()
+
+                # 滿倉檢查：已達 MAX_POSITIONS 時跳過進場掃描，節省 API 額度
+                if len(bot.positions) >= MAX_POSITIONS:
+                    print(f"[策略] 已持 {len(bot.positions)} 檔（上限 {MAX_POSITIONS}），跳過進場掃描。")
+                    time.sleep(SCAN_INTERVAL)
+                    continue
 
                 # 大盤過濾
                 if not bot.check_market_trend():
