@@ -620,7 +620,27 @@ class AITradingBot:
                 print("[持倉] 目前無持股")
                 return
 
+            # 查詢今日買入紀錄，用於精確判斷 T+1
+            today_buys: set[str] = set()
+            try:
+                try:
+                    trades = self.api.list_trades(self.api.stock_account)
+                except TypeError:
+                    trades = self.api.list_trades()
+                today_str = now_tw().strftime("%Y-%m-%d")
+                for t in (trades or []):
+                    action = str(getattr(getattr(t, "order", None), "action", ""))
+                    code   = getattr(getattr(t, "contract", None), "code", "")
+                    ts     = str(getattr(getattr(t, "status", None), "order_datetime", ""))
+                    if "Buy" in action and ts.startswith(today_str):
+                        today_buys.add(code)
+            except Exception as e:
+                print(f"[持倉] list_trades 查詢失敗（T+1 判斷可能不準）: {e}")
+
             print(f"[持倉] 查詢到 {len(held)} 筆持股，同步中...")
+            if today_buys:
+                print(f"[持倉] 今日買入：{today_buys}（T+1 不可當日賣出）")
+
             for p in held:
                 code = p.code
                 if code in self.positions:
@@ -632,14 +652,19 @@ class AITradingBot:
                     entry_price=float(avg_price),
                     qty=int(qty),
                 )
-                # 同步進來的舊部位：entry_time 設為昨天，避免被 T+1 規則擋住出場
-                pos.entry_time = now_tw() - timedelta(days=1)
+                if code in today_buys:
+                    # 今日買入：保留 entry_time 為今天（__post_init__ 已設），T+1 保護生效
+                    t1_label = "（今日買入，T+1）"
+                else:
+                    # 非今日買入：設為昨天，允許出場
+                    pos.entry_time = now_tw() - timedelta(days=1)
+                    t1_label = ""
                 self.positions[code] = pos
                 last  = float(getattr(p, "last_price", avg_price) or avg_price)
                 pnl   = (last - float(avg_price)) * int(qty)
                 print(
                     f"  {code}  均價={avg_price}  持股={qty}股  "
-                    f"現值≈{last}  損益={pnl:+.0f}元"
+                    f"現值≈{last}  損益={pnl:+.0f}元{t1_label}"
                 )
         except Exception as e:
             print(f"[持倉] 查詢失敗: {e}")
@@ -1126,33 +1151,51 @@ class AITradingBot:
             return None
 
     def _execute_buy(self, c: "BuyCandidate", sentiment_score: float, analysis: str) -> None:
-        """對已通過評估的候選標的執行買進下單"""
+        """對已通過評估的候選標的執行買進下單，並確認成交後更新部位"""
         contract = self.api.Contracts.Stocks[c.code]
         ok = self._place_odd_order(contract, c.price, c.qty, sj.constant.Action.Buy)
         if not ok:
             print(f"[買進] {c.code} 下單被拒，跳過。")
             return
+
+        # 確認成交：以實際成交價格/數量建立部位
+        fill = self._confirm_fill(c.code, "Buy")
+        actual_price = fill["deal_price"] if fill and fill["deal_qty"] > 0 else c.price
+        actual_qty   = fill["deal_qty"]   if fill and fill["deal_qty"] > 0 else c.qty
+
+        # 以實際成交價重算止損/止盈
+        stop_p  = actual_price * (1 - STOP_LOSS_PCT)
+        trail_p = actual_price * (1 + TRAILING_START)
+        if c.atr_val > 0:
+            stop_p = max(actual_price - 1.5 * c.atr_val, stop_p)
+
         pos = Position(
             code=c.code,
-            entry_price=c.price,
-            qty=c.qty,
+            entry_price=actual_price,
+            qty=actual_qty,
             atr=c.atr_val,
-            stop_price=c.stop_price,
-            trail_price=c.trail_price,
+            stop_price=stop_p,
+            trail_price=trail_p,
             entry_score=sentiment_score,
             entry_rsi=c.rsi,
             entry_vwap=c.vwap,
             entry_chips=c.chip_score,
         )
         self.positions[c.code] = pos
-        self._trade_log("BUY", pos, c.price)
+        self._trade_log("BUY", pos, actual_price)
         tag = "買進" if c.strategy == "momentum" else "均值回歸買進"
+        fill_note = ""
+        if fill and fill["deal_qty"] > 0 and abs(actual_price - c.price) > 0.01:
+            fill_note = f"\n實際成交：{actual_qty}股 @ {actual_price:.2f}"
+        elif fill and fill["deal_qty"] == 0:
+            fill_note = "\n⏳ 尚未成交，待後續確認"
         send_notify(
             f"[{tag}] {c.code}\n"
-            f"價格: {c.price}  數量: {c.qty} 股\n"
+            f"委託: {c.price} x {c.qty}股\n"
             f"VWAP: {c.vwap:.2f}  RSI: {c.rsi:.1f}  法人: {c.chip_score:+.2f}\n"
-            f"止損價: {c.stop_price:.2f}  止盈啟動: {c.trail_price:.2f}\n"
+            f"止損價: {stop_p:.2f}  止盈啟動: {trail_p:.2f}\n"
             f"ATR: {c.atr_val:.2f}  情緒: {sentiment_score:+.2f}  {analysis}"
+            + fill_note
         )
 
     def scan_candidates(
@@ -1320,18 +1363,30 @@ class AITradingBot:
         if not ok:
             print(f"[警告] {code} 賣單被拒，部位保留，下輪繼續監控。")
             return
-        profit_pct = pos.profit_pct(price)
-        net_pnl    = (price - pos.entry_price) * qty * (1 - TRADE_COST_PCT)
-        self._trade_log("SELL", pos, price, reason=reason)   # 2.3
+
+        # 確認成交：以實際成交價計算損益
+        fill = self._confirm_fill(code, "Sell")
+        actual_price = fill["deal_price"] if fill and fill["deal_qty"] > 0 else price
+        actual_qty   = fill["deal_qty"]   if fill and fill["deal_qty"] > 0 else qty
+
+        profit_pct = (actual_price - pos.entry_price) / pos.entry_price if pos.entry_price else 0
+        net_pnl    = (actual_price - pos.entry_price) * actual_qty * (1 - TRADE_COST_PCT)
+        self._trade_log("SELL", pos, actual_price, reason=reason)   # 2.3
         # 移除部位，但 _pending_orders 保留 Position 副本
         # 若賣單被取消，_sync_pending_orders 會將部位恢復
         self._pending_sell_positions[code] = pos
         del self.positions[code]
+        fill_note = ""
+        if fill and fill["deal_qty"] > 0 and abs(actual_price - price) > 0.01:
+            fill_note = f"\n實際成交：{actual_qty}股 @ {actual_price:.2f}"
+        elif fill and fill["deal_qty"] == 0:
+            fill_note = "\n⏳ 尚未成交，待後續確認"
         send_notify(
             f"[賣出] {code}  {reason}\n"
-            f"賣出價: {price}  獲利: {profit_pct:+.2%}\n"
-            f"成本: {pos.entry_price}  數量: {qty} 股\n"
+            f"委託: {price} x {qty}股\n"
+            f"成本: {pos.entry_price}  獲利: {profit_pct:+.2%}\n"
             f"淨損益: {net_pnl:+.0f} 元"
+            + fill_note
         )
 
     # ------------------------------------------------------------------
@@ -1400,6 +1455,51 @@ class AITradingBot:
             }
             print(f"[委託追蹤] {act_str} {code} x{qty} @ {price} 加入追蹤")
         return ok
+
+    # ------------------------------------------------------------------
+    # 下單後即時確認成交：等待數秒後查 update_status 確認成交結果
+    # ------------------------------------------------------------------
+    def _confirm_fill(self, code: str, expected_action: str) -> dict | None:
+        """
+        下單後短暫等待，查詢成交結果。
+        回傳 {"deal_qty": int, "deal_price": float, "status": str} 或 None（查詢失敗）。
+        """
+        pending = self._pending_orders.get(code)
+        if not pending:
+            return None
+        trade_obj = pending["trade"]
+
+        # 等待交易所回報（零股通常 1~3 秒內回報）
+        time.sleep(3)
+
+        try:
+            self.api.update_status(self.api.stock_account)
+        except Exception:
+            pass
+
+        try:
+            status_obj = getattr(trade_obj, "status", None)
+            status_str = str(getattr(status_obj, "status", ""))
+            deal_qty   = int(getattr(status_obj, "deal_quantity", 0))
+            # 計算成交均價（從 deals 列表）
+            deals = getattr(trade_obj, "deals", []) or []
+            if deals:
+                total_amt = sum(float(getattr(d, "price", 0)) * int(getattr(d, "quantity", 0)) for d in deals)
+                total_qty = sum(int(getattr(d, "quantity", 0)) for d in deals)
+                deal_price = total_amt / total_qty if total_qty > 0 else pending["price"]
+            else:
+                deal_price = pending["price"]
+
+            result = {"deal_qty": deal_qty, "deal_price": deal_price, "status": status_str}
+            print(
+                f"[成交確認] {expected_action} {code}  "
+                f"狀態={status_str}  成交={deal_qty}/{pending['qty']}股"
+                + (f"  均價={deal_price:.2f}" if deal_qty > 0 else "")
+            )
+            return result
+        except Exception as e:
+            print(f"[成交確認] {code} 查詢失敗: {e}")
+            return None
 
     # ------------------------------------------------------------------
     # 委託成交確認：同步 list_trades() 更新委託狀態
@@ -1484,6 +1584,100 @@ class AITradingBot:
             for info in self._pending_orders.values()
             if info["action"] == "Buy"
         )
+
+    # ------------------------------------------------------------------
+    # 部位校驗：比對 self.positions 與 API 實際持倉
+    # ------------------------------------------------------------------
+    def _verify_positions(self) -> None:
+        """
+        買入前呼叫。比對 self.positions 與 list_positions：
+        - API 有但 bot 沒有 → 補入（可能是手動買入或上次未紀錄）
+        - bot 有但 API 沒有 → 移除（可能已成交賣出但 bot 未同步）
+        - 數量不一致 → 以 API 為準更新
+        """
+        try:
+            held = self.api.list_positions(self.api.stock_account, unit=sj.constant.Unit.Share)
+        except Exception as e:
+            print(f"[部位校驗] 查詢失敗: {e}")
+            return
+
+        api_codes = {}
+        for p in (held or []):
+            code = p.code
+            qty  = int(getattr(p, "quantity", 0))
+            if qty > 0:
+                api_codes[code] = {
+                    "qty": qty,
+                    "price": float(getattr(p, "price", None) or getattr(p, "average_price", 0)),
+                    "last": float(getattr(p, "last_price", 0) or 0),
+                }
+
+        changed = False
+
+        # API 有但 bot 沒有 → 補入
+        for code, info in api_codes.items():
+            if code not in self.positions:
+                # 排除正在賣出中的（pending sell）
+                if code in self._pending_orders and self._pending_orders[code]["action"] == "Sell":
+                    continue
+                pos = Position(code=code, entry_price=info["price"], qty=info["qty"])
+                pos.entry_time = now_tw() - timedelta(days=1)  # 預設為非今日
+                self.positions[code] = pos
+                print(f"[部位校驗] 補入 {code} {info['qty']}股 均價={info['price']}")
+                changed = True
+
+        # bot 有但 API 沒有 → 移除
+        stale = [code for code in self.positions if code not in api_codes]
+        for code in stale:
+            # 排除正在買入中的（pending buy）
+            if code in self._pending_orders and self._pending_orders[code]["action"] == "Buy":
+                continue
+            print(f"[部位校驗] 移除 {code}（API 已無持倉）")
+            del self.positions[code]
+            changed = True
+
+        # 數量不一致 → 以 API 為準
+        for code in list(self.positions):
+            if code in api_codes and self.positions[code].qty != api_codes[code]["qty"]:
+                old_qty = self.positions[code].qty
+                self.positions[code].qty = api_codes[code]["qty"]
+                print(f"[部位校驗] {code} 數量更新 {old_qty} → {api_codes[code]['qty']}股")
+                changed = True
+
+        if not changed:
+            print("[部位校驗] 部位一致")
+
+    # ------------------------------------------------------------------
+    # 定期狀態報告：委託 + 部位狀況推播至 Telegram
+    # ------------------------------------------------------------------
+    def periodic_status_report(self) -> None:
+        """每 30 分鐘呼叫一次，推播委託與部位狀態"""
+        lines = [f"[定期狀態報告] {now_tw().strftime('%H:%M:%S')}"]
+
+        # 1) 同步委託狀態
+        self._sync_pending_orders()
+
+        # 2) 未完成委託
+        if self._pending_orders:
+            lines.append(f"\n[未完成委託] {len(self._pending_orders)} 筆")
+            for code, info in self._pending_orders.items():
+                lines.append(
+                    f"  {info['action']} {code}  "
+                    f"{info['qty']}股 @ {info['price']}  "
+                    f"金額 {info['amount']:,.0f} 元"
+                )
+        else:
+            lines.append("\n[未完成委託] 無")
+
+        # 3) 校驗部位
+        self._verify_positions()
+
+        # 4) 目前持倉
+        lines.append(f"\n{self.get_positions_summary()}")
+
+        report = "\n".join(lines)
+        print(report)
+        send_notify(report)
 
     def daily_summary(self) -> str:
         """產生今日交易總結，包含成交紀錄、損益與持倉狀況"""
@@ -1606,7 +1800,9 @@ if __name__ == "__main__":
 
     last_digest_sent: float = time.time()
     last_budget_refresh: float = time.time()
-    BUDGET_REFRESH_INTERVAL = 600   # 每 10 分鐘重查 settlements() 更新預算
+    last_status_report: float = time.time()
+    BUDGET_REFRESH_INTERVAL = 600    # 每 10 分鐘重查 settlements() 更新預算
+    STATUS_REPORT_INTERVAL  = 1800   # 每 30 分鐘推播委託 + 部位狀態
 
     try:
         while True:
@@ -1627,6 +1823,11 @@ if __name__ == "__main__":
 
                 # 委託成交確認（每輪必跑，更新凍結資金 / 恢復取消部位）
                 bot._sync_pending_orders()
+
+                # 定期狀態報告（每 30 分鐘推播委託 + 部位至 Telegram）
+                if time.time() - last_status_report >= STATUS_REPORT_INTERVAL:
+                    bot.periodic_status_report()
+                    last_status_report = time.time()
 
                 # 出場監控（每輪必跑，不受任何過濾影響）
                 bot.monitor_exit()
@@ -1681,6 +1882,10 @@ if __name__ == "__main__":
                             f"波動率：{alloc.vol_ann:.1%}\n"
                             f"動能：{alloc.momentum_budget_pct:.0%}  均值回歸：{alloc.mean_reversion_budget_pct:.0%}"
                         )
+
+                    # 買入前校驗：確認委託已成交、部位與 API 一致
+                    bot._sync_pending_orders()
+                    bot._verify_positions()
 
                     # 統一由 scan_candidates() 處理策略分配（已內建 RANGING/TRENDING 邏輯）
                     bot.scan_candidates(bot.watch_list, score, analysis, alloc)
