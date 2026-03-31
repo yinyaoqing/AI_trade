@@ -54,8 +54,6 @@ TRAILING_START       = 0.015   # 移動止盈啟動點：獲利達 1.5%
 TRAILING_PULLBACK    = 0.015    # 移動止盈觸發（ATR 不足時的保底固定回撤）
 TRAILING_ATR_MULT    = 0.6     # 動態回撤：從最高點回落 0.6×ATR 時出場（ATR 夠大時優先）
 BREAKEVEN_TRIGGER    = 0.02    # 成本保衛：獲利達 2% 時自動將止損上移至成本價
-TIME_STOP_MINUTES    = 0      # 時間停損：進場後 X 分鐘仍在成本區則主動出場
-TIME_STOP_BAND       = 0.005   # 成本區定義：距進場價 ±0.5% 以內視為「原地踏步」
 SLIPPAGE_LIMIT       = 0.01    # 滑點保護：買賣價差 > 1%（零股市場天生價差較大，原 0.5% 過嚴）
 MIN_ORDER_VALUE      = 9_000   # 最小下單金額（元）：確保手續費占比 < 0.1%，避免最低手續費侵蝕獲利
 
@@ -1331,17 +1329,6 @@ class AITradingBot:
                         reason = (f"移動止盈（高點{pos.max_price}，"
                                   f"回吐{pullback:.2%}≥門檻{pullback_threshold:.2%}，"
                                   f"獲利{profit:.2%}）")
-
-            # ── D. 時間停損（Time Stop）───────────────────────────────
-            # 進場後 TIME_STOP_MINUTES 分鐘內，價格仍在成本 ±TIME_STOP_BAND 區間
-            # 且尚未啟動移動止盈（未突破 trail_price）→ 動能消失，主動離場
-            if not reason:
-                held_mins = (now_tw() - pos.entry_time).total_seconds() / 60
-                in_band   = abs(profit) <= TIME_STOP_BAND
-                not_trailed = current < pos.trail_price
-                if held_mins >= TIME_STOP_MINUTES and in_band and not_trailed:
-                    reason = (f"時間停損（持有{held_mins:.0f}分，"
-                              f"價格停滯{profit:+.2%}，動能消失）")
 
             if reason:
                 self._execute_exit(code, current, reason)
