@@ -707,12 +707,16 @@ class AITradingBot:
         except Exception:
             return "（餘額查詢失敗，無法計算）"
 
-        # 未交割淨額（全部，不分 T+0 / T+1）
+        # 未交割淨額：s_date <= today 已計入 acc_balance，只算未來的
         net_settlement = 0.0
         try:
             settlements = self.api.settlements(self.api.stock_account)
             if settlements:
-                net_settlement = sum(s.amount for s in settlements)
+                today_dt = now_tw().date()
+                net_settlement = sum(
+                    s.amount for s in settlements
+                    if (s.date if hasattr(s.date, "year") else s.date) > today_dt
+                )
         except Exception:
             pass
 
