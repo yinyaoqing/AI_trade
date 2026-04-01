@@ -43,8 +43,8 @@ load_dotenv()
 # 1. 參數設定
 # =============================================================================
 
-INITIAL_CAPITAL   = 26000   # 原始投入資金（元），用於計算累計損益
-TOTAL_BUDGET      = 26000   # 總預算（元）
+INITIAL_CAPITAL   = 27000   # 原始投入資金（元），用於計算累計損益
+TOTAL_BUDGET      = 27000   # 總預算（元）
 MAX_POSITIONS     = 2       # 最多同時持有部位數
 POSITION_SIZE     = TOTAL_BUDGET // MAX_POSITIONS  # 初始值，MIN_ORDER_VALUE 定義後由 _calc_position_size() 修正
 
