@@ -129,8 +129,7 @@ def check_account() -> None:
         lines.append(f"[持倉] 查詢失敗：{e}")
 
     # ── 5. 未交割明細 ─────────────────────────────────────────────────
-    # T+0 應付在十點後已反映在 acc_balance，不重複計算。
-    # 應收全部列入顯示（bot.py 購買決策另行套用嚴格 T+1 規則）。
+    # s_date <= today 的應收/應付皆已反映在 acc_balance，不重複計算。
     lines.append("")
     try:
         settlements = api.settlements(stock_account)
@@ -146,7 +145,7 @@ def check_account() -> None:
                 lines.append(f"[買進待付] 共 {len(pays)} 筆")
                 for s in pays:
                     s_date = s.date if hasattr(s.date, "year") else s.date
-                    note = "  ← 已扣款" if s_date <= today else ""
+                    note = "  ← 已計入餘額" if s_date <= today else ""
                     lines.append(f"  {s.date}  T+{s.T}  {s.amount:+,.0f} 元{note}")
             else:
                 lines.append("[買進待付] 無")
@@ -158,8 +157,7 @@ def check_account() -> None:
                 lines.append(f"[賣出待收] 共 {len(recs)} 筆")
                 for s in recs:
                     s_date = s.date if hasattr(s.date, "year") else s.date
-                    avail_date = s_date + timedelta(days=1)
-                    note = "（已可用）" if s_date < today else f"（{avail_date} 起可用）"
+                    note = "（已計入餘額）" if s_date <= today else ""
                     lines.append(f"  {s.date}  T+{s.T}  {s.amount:+,.0f} 元  {note}")
             else:
                 lines.append("[賣出待收] 無")
@@ -167,19 +165,23 @@ def check_account() -> None:
             lines.append("")
 
             # ── [安全可動用現金] ──
-            # acc_balance 已扣 T+0 應付，只加未來應付與全部應收
+            # acc_balance 已含今日（含）以前的應收/應付，只計未來的
             if acc_balance is not None:
                 future_payable = sum(
                     s.amount for s in pays
                     if (s.date if hasattr(s.date, "year") else s.date) > today
                 )
-                total_receivable = sum(s.amount for s in recs)
-                safe = acc_balance + future_payable + total_receivable
+                future_receivable = sum(
+                    s.amount for s in recs
+                    if (s.date if hasattr(s.date, "year") else s.date) > today
+                )
+                safe = acc_balance + future_payable + future_receivable
                 lines.append("[安全可動用現金]")
                 lines.append(f"  帳戶餘額：{acc_balance:,.0f} 元")
                 if future_payable:
-                    lines.append(f"  未來應付（未扣款）：{future_payable:,.0f} 元")
-                lines.append(f"  待收款：{total_receivable:+,.0f} 元")
+                    lines.append(f"  未來應付：{future_payable:,.0f} 元")
+                if future_receivable:
+                    lines.append(f"  未來應收：{future_receivable:+,.0f} 元")
                 lines.append(f"  ────────────────────────────────")
                 lines.append(f"  預計可動用：{safe:,.0f} 元")
     except Exception as e:

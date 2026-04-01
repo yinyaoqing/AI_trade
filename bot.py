@@ -530,10 +530,8 @@ class AITradingBot:
                 return
 
             # 查詢未交割淨額
-            # 規則：
-            #   應付（負）：s_date <= today → 已反映在 acc_balance，不重複計算
-            #               s_date >  today → 未來待扣款，計入
-            #   應收（正）：全部計入（含今日與未來待收）
+            # 規則：s_date <= today（T+0）的應收/應付皆已反映在 acc_balance，不重複計算
+            #        s_date >  today 的才計入
             net_settlement = 0.0
             payable = receivable = 0.0
             settlement_lines: list[str] = []
@@ -543,14 +541,16 @@ class AITradingBot:
                     today_dt = now_tw().date()
                     for s in settlements:
                         s_date = s.date if hasattr(s.date, "year") else s.date
-                        if s.amount < 0:
-                            if s_date <= today_dt:
-                                note = "（已扣款）"
-                            else:
-                                payable += s.amount
-                                note = ""
+                        if s_date <= today_dt:
+                            # 今日（含）以前：已計入交割款餘額
+                            label = "應付" if s.amount < 0 else "應收"
                             settlement_lines.append(
-                                f"  {s.date} T+{s.T} 應付 {s.amount:+,.0f} 元 {note}"
+                                f"  {s.date} T+{s.T} {label} {s.amount:+,.0f} 元（已計入餘額）"
+                            )
+                        elif s.amount < 0:
+                            payable += s.amount
+                            settlement_lines.append(
+                                f"  {s.date} T+{s.T} 應付 {s.amount:+,.0f} 元"
                             )
                         else:
                             receivable += s.amount
@@ -560,7 +560,7 @@ class AITradingBot:
                     net_settlement = payable + receivable
                     print(
                         f"[預算] 未交割：應付（未扣）{payable:,.0f} 元  "
-                        f"應收 {receivable:+,.0f} 元  淨額 {net_settlement:+,.0f} 元"
+                        f"應收（未入帳）{receivable:+,.0f} 元  淨額 {net_settlement:+,.0f} 元"
                     )
             except Exception as e:
                 print(f"[預算] 未交割查詢失敗，以 0 計算：{e}")
