@@ -378,11 +378,19 @@ class AITradingBot:
         print(f"[初始化] 登入回應：{accounts}")
 
         print("[初始化] 下載合約中...")
-        self.api.fetch_contracts(
-            contract_download=True,
-            contracts_timeout=30000,
-            contracts_cb=lambda: print("[初始化] 合約下載完成"),
-        )
+        for _retry in range(3):
+            try:
+                self.api.fetch_contracts(
+                    contract_download=True,
+                    contracts_timeout=60000,
+                    contracts_cb=lambda: print("[初始化] 合約下載完成"),
+                )
+                break
+            except TimeoutError:
+                print(f"[初始化] 合約下載逾時，第 {_retry + 1}/3 次重試...")
+                time.sleep(5)
+        else:
+            raise RuntimeError("合約下載連續 3 次逾時，請稍後重試")
 
         ca_path = os.environ["CA_CERT_PATH"].strip()
         ca_pass = os.environ["CA_PASSWORD"].strip()
