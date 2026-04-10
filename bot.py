@@ -1451,6 +1451,7 @@ class AITradingBot:
                 "qty": qty,
                 "amount": price * qty,
                 "trade": trade,
+                "created_at": time.time(),
             }
             print(f"[委託追蹤] {act_str} {code} x{qty} @ {price} 加入追蹤")
         return ok
@@ -1495,6 +1496,11 @@ class AITradingBot:
                 f"狀態={status_str}  成交={deal_qty}/{pending['qty']}股"
                 + (f"  均價={deal_price:.2f}" if deal_qty > 0 else "")
             )
+            # 全部成交 → 立即移除 pending，避免凍結金額殘留
+            if deal_qty >= pending["qty"] or "Filled" in status_str:
+                self._pending_orders.pop(code, None)
+                self._pending_sell_positions.pop(code, None)
+                print(f"[委託追蹤] {code} 已確認成交，解除凍結")
             return result
         except Exception as e:
             print(f"[成交確認] {code} 查詢失敗: {e}")
@@ -1572,6 +1578,17 @@ class AITradingBot:
                 if info["action"] == "Sell" and code not in self.positions:
                     # 賣單未成交但部位已被移除 → 發出警告
                     print(f"[委託追蹤] ⚠️ {code} 賣單未成交（{deal_qty}/{order_qty}），部位已移除")
+
+        # 超時安全閥：委託超過 10 分鐘仍未 resolve，強制清除
+        PENDING_TIMEOUT = 600
+        now_ts = time.time()
+        for code, info in list(self._pending_orders.items()):
+            if code in resolved:
+                continue
+            age = now_ts - info.get("created_at", now_ts)
+            if age > PENDING_TIMEOUT:
+                print(f"[委託追蹤] {info['action']} {code} 超過 {PENDING_TIMEOUT}s 未確認，強制解除凍結")
+                resolved.append(code)
 
         for code in resolved:
             del self._pending_orders[code]
