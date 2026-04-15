@@ -54,8 +54,22 @@ TRAILING_START       = 0.015   # 移動止盈啟動點：獲利達 1.5%
 TRAILING_PULLBACK    = 0.015    # 移動止盈觸發（ATR 不足時的保底固定回撤）
 TRAILING_ATR_MULT    = 0.6     # 動態回撤：從最高點回落 0.6×ATR 時出場（ATR 夠大時優先）
 BREAKEVEN_TRIGGER    = 0.02    # 成本保衛：獲利達 2% 時自動將止損上移至成本價
+TIME_STOP_BDAYS      = 5       # 時間停損：持有超過 N 個工作天仍未觸發其他出場條件 → 強制出場，釋放資金
 SLIPPAGE_LIMIT       = 0.01    # 滑點保護：買賣價差 > 1%（零股市場天生價差較大，原 0.5% 過嚴）
 MIN_ORDER_VALUE      = 9_000   # 最小下單金額（元）：確保手續費占比 < 0.1%，避免最低手續費侵蝕獲利
+
+
+def _business_days_between(start_date, end_date) -> int:
+    """計算兩日期間的工作天數（不含週末，不考慮國定假日）"""
+    if start_date >= end_date:
+        return 0
+    days = 0
+    d = start_date
+    while d < end_date:
+        d += timedelta(days=1)
+        if d.weekday() < 5:  # 0=Mon, 4=Fri
+            days += 1
+    return days
 
 
 def _calc_position_size(total_budget: float) -> int:
@@ -658,19 +672,39 @@ class AITradingBot:
                     entry_price=float(avg_price),
                     qty=int(qty),
                 )
-                if code in today_buys:
-                    # 今日買入：保留 entry_time 為今天（__post_init__ 已設），T+1 保護生效
+
+                # 查詢 position_detail 取得實際買入日期
+                entry_date = None
+                try:
+                    pid = getattr(p, "id", None)
+                    if pid is not None:
+                        details = self.api.list_position_detail(self.api.stock_account, pid)
+                        dates = [getattr(d, "date", None) for d in (details or [])]
+                        dates = [d for d in dates if d]
+                        if dates:
+                            earliest = min(dates)  # 取最早一筆作為實際進場日
+                            if isinstance(earliest, str):
+                                entry_date = datetime.strptime(earliest[:10], "%Y-%m-%d").replace(tzinfo=TZ_TW)
+                            elif hasattr(earliest, "year"):
+                                entry_date = datetime(earliest.year, earliest.month, earliest.day, tzinfo=TZ_TW)
+                except Exception as e:
+                    print(f"[持倉] {code} list_position_detail 失敗: {e}")
+
+                if entry_date is not None:
+                    pos.entry_time = entry_date
+                    t1_label = f"（進場日 {entry_date.strftime('%Y-%m-%d')}）"
+                elif code in today_buys:
                     t1_label = "（今日買入，T+1）"
                 else:
-                    # 非今日買入：設為昨天，允許出場
                     pos.entry_time = now_tw() - timedelta(days=1)
-                    t1_label = ""
+                    t1_label = "（日期未知）"
+
                 self.positions[code] = pos
                 last  = float(getattr(p, "last_price", avg_price) or avg_price)
                 pnl   = (last - float(avg_price)) * int(qty)
                 print(
                     f"  {code}  均價={avg_price}  持股={qty}股  "
-                    f"現值≈{last}  損益={pnl:+.0f}元{t1_label}"
+                    f"現值≈{last}  損益={pnl:+.0f}元 {t1_label}"
                 )
         except Exception as e:
             print(f"[持倉] 查詢失敗: {e}")
@@ -699,6 +733,96 @@ class AITradingBot:
             lines.append(
                 f"  {code}  {qty}股  均價={avg_price}  現價={last}  "
                 f"損益={pnl:+.0f}元 ({pct:+.2f}%)"
+            )
+        lines.append(f"  合計未實現損益：{total_pnl:+.0f} 元")
+        return "\n".join(lines)
+
+    def get_positions_with_exits(self) -> str:
+        """
+        回傳持倉摘要 + 出場條件（stop / 成本保衛 / 移動止盈門檻）。
+        供定期狀態報告使用。
+        """
+        if not self.positions:
+            return "[持倉] 無"
+
+        # 取得現價（snapshot）
+        snaps: dict[str, float] = {}
+        try:
+            contracts = [self.api.Contracts.Stocks[c] for c in self.positions]
+            for s in self.api.snapshots(contracts):
+                snaps[s.code] = float(s.close)
+        except Exception as e:
+            print(f"[狀態報告] snapshot 失敗: {e}")
+
+        lines = [f"[持倉] {len(self.positions)} 筆"]
+        total_pnl = 0.0
+        for code, pos in self.positions.items():
+            current = snaps.get(code, pos.entry_price)
+            pos.update_max(current)
+            pnl     = (current - pos.entry_price) * pos.qty
+            profit  = (current - pos.entry_price) / pos.entry_price if pos.entry_price else 0
+            total_pnl += pnl
+
+            # 出場條件計算
+            breakeven_price = pos.entry_price * (1 + BREAKEVEN_TRIGGER)
+            trail_start     = pos.trail_price
+            # 動態回吐門檻（同 monitor_exit 邏輯）
+            atr_pullback    = TRAILING_ATR_MULT * pos.atr if pos.atr > 0 else 0
+            pullback_pct    = max(atr_pullback / pos.max_price if pos.max_price else 0,
+                                  TRAILING_PULLBACK)
+            trail_exit_price = pos.max_price * (1 - pullback_pct)
+
+            # 當前哪個條件最接近？
+            if current <= pos.stop_price:
+                state = "🔴 已觸發止損"
+            elif pos.stop_price >= pos.entry_price:
+                state = "🟢 成本保衛啟動"
+            elif profit >= BREAKEVEN_TRIGGER:
+                state = "🟡 即將啟動成本保衛"
+            elif current >= trail_start:
+                state = "🟢 移動止盈監控中"
+            else:
+                state = "⚪ 等待進入止盈區"
+
+            # 持有時間（以日為單位，不足一天顯示小時）
+            held_delta = now_tw() - pos.entry_time
+            held_days  = held_delta.days
+            held_hours = held_delta.seconds // 3600
+            if held_days >= 1:
+                held_str = f"{held_days}天"
+            else:
+                held_mins = (held_delta.seconds % 3600) // 60
+                held_str  = f"{held_hours}時{held_mins}分"
+            entry_date_str = pos.entry_time.strftime("%Y-%m-%d")
+
+            lines.append(
+                f"  {code}  {pos.qty}股  均價={pos.entry_price:.2f}  現價={current:.2f}"
+                f"  損益={pnl:+.0f}元 ({profit:+.2%})"
+            )
+            lines.append(
+                f"    狀態：{state}  歷史高={pos.max_price:.2f}"
+                f"  進場日={entry_date_str}  持有={held_str}"
+            )
+            lines.append(
+                f"    A.止損={pos.stop_price:.2f}（-{(1-pos.stop_price/pos.entry_price)*100:.2f}%）"
+                f"  B.成本保衛觸發={breakeven_price:.2f}"
+            )
+            lines.append(
+                f"    C.止盈啟動={trail_start:.2f}"
+                f"  回吐出場={trail_exit_price:.2f}（門檻 {pullback_pct:.2%}）"
+            )
+            # D. 時間停損
+            held_bdays  = _business_days_between(pos.entry_time.date(), now_tw().date())
+            remain      = max(TIME_STOP_BDAYS - held_bdays, 0)
+            peak_growth = (pos.max_price - pos.entry_price) / pos.entry_price if pos.entry_price else 0
+            if peak_growth >= TRAILING_START:
+                d_note = f"歷史高獲利{peak_growth:+.2%} ≥ {TRAILING_START:.1%}，已避開"
+            elif held_bdays >= TIME_STOP_BDAYS:
+                d_note = f"🔴 條件達成（將於下輪出場）"
+            else:
+                d_note = f"歷史高獲利{peak_growth:+.2%}，剩 {remain} 工作天"
+            lines.append(
+                f"    D.時間停損={TIME_STOP_BDAYS}工作天  已持有 {held_bdays} 工作天  {d_note}"
             )
         lines.append(f"  合計未實現損益：{total_pnl:+.0f} 元")
         return "\n".join(lines)
@@ -1342,6 +1466,21 @@ class AITradingBot:
                                   f"回吐{pullback:.2%}≥門檻{pullback_threshold:.2%}，"
                                   f"獲利{profit:.2%}）")
 
+            # ── D. 時間停損 ───────────────────────────────────────────
+            # 持有滿 TIME_STOP_BDAYS 工作天內未觸發 A/B/C，且獲利無明顯成長 → 強制出場
+            # 「無明顯成長」定義：歷史高點未曾突破移動止盈啟動價（entry × (1+TRAILING_START)）
+            #                    代表從未進入止盈區，動能消失，佔用資金
+            if not reason:
+                held_bdays = _business_days_between(pos.entry_time.date(), now_tw().date())
+                peak_growth = (pos.max_price - pos.entry_price) / pos.entry_price if pos.entry_price else 0
+                no_growth = peak_growth < TRAILING_START
+                if held_bdays >= TIME_STOP_BDAYS and no_growth:
+                    contract = self.api.Contracts.Stocks[code]
+                    if self.check_slippage_safe(contract):
+                        reason = (f"時間停損（持有 {held_bdays} 工作天，"
+                                  f"歷史高獲利{peak_growth:+.2%} < {TRAILING_START:.1%}，"
+                                  f"動能不足，釋放資金）")
+
             if reason:
                 self._execute_exit(code, current, reason)
 
@@ -1688,8 +1827,8 @@ class AITradingBot:
         # 3) 校驗部位
         self._verify_positions()
 
-        # 4) 目前持倉
-        lines.append(f"\n{self.get_positions_summary()}")
+        # 4) 目前持倉 + 出場條件
+        lines.append(f"\n{self.get_positions_with_exits()}")
 
         report = "\n".join(lines)
         print(report)
