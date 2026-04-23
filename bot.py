@@ -6,6 +6,7 @@ AI 模擬交易機器人
 - 支援：多標的同時監控，最多 MAX_POSITIONS 個部位
 """
 
+import math
 import os
 import sys
 import time
@@ -1309,9 +1310,17 @@ class AITradingBot:
 
             qty = max(int(budget / sig.current_price), 1)
             # 最小下單金額：防止手續費侵蝕（零股最低手續費陷阱）
+            # 強烈超賣（RSI<25）且差額不大時，補足股數至門檻以進場
             if qty * sig.current_price < MIN_ORDER_VALUE:
-                print(f"[均值回歸/{stock_code}] 下單金額 {qty * sig.current_price:,.0f} 元 < 最低 {MIN_ORDER_VALUE:,} 元，跳過。")
-                return None
+                needed = math.ceil((MIN_ORDER_VALUE - qty * sig.current_price) / sig.current_price)
+                extra_cost = needed * sig.current_price
+                if sig.rsi < 25 and extra_cost <= sig.current_price * 5:
+                    # 最多補 5 股，避免資金失控
+                    qty += needed
+                    print(f"[均值回歸/{stock_code}] RSI={sig.rsi:.1f} 強烈超賣，補 {needed} 股至 {qty*sig.current_price:,.0f} 元")
+                else:
+                    print(f"[均值回歸/{stock_code}] 下單金額 {qty * sig.current_price:,.0f} 元 < 最低 {MIN_ORDER_VALUE:,} 元，跳過。")
+                    return None
             # 排序分：RSI 低於 30 的距離（越低越強）+ 法人情緒
             rsi_gap   = max(30 - sig.rsi, 0) / 30               # 0~1
             chip_norm = (chip_score + 1) / 2

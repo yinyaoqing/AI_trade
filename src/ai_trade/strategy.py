@@ -79,9 +79,13 @@ def momentum_signal(df: pd.DataFrame, code: str) -> Signal:
     """
     動能策略：收盤 > VWAP 且 RSI < 70
     """
-    vwap  = ta.vwap(df["High"], df["Low"], df["Close"], df["Volume"]).iloc[-1]
-    rsi   = ta.rsi(df["Close"], length=14).iloc[-1]
-    price = df["Close"].iloc[-1]
+    price  = df["Close"].iloc[-1] if not df.empty else 0
+    vwap_s = ta.vwap(df["High"], df["Low"], df["Close"], df["Volume"])
+    rsi_s  = ta.rsi(df["Close"], length=14)
+    if vwap_s is None or rsi_s is None or vwap_s.empty or rsi_s.empty:
+        return Signal(code, "SKIP", "momentum", price, 0, 0, "指標資料不足")
+    vwap = vwap_s.iloc[-1]
+    rsi  = rsi_s.iloc[-1]
 
     if pd.isna(vwap) or pd.isna(rsi):
         return Signal(code, "SKIP", "momentum", price, 0, 0, "指標資料不足")
@@ -99,9 +103,13 @@ def mean_reversion_signal(df: pd.DataFrame, code: str) -> Signal:
     """
     均值回歸策略：RSI < 30（超賣）且收盤 < VWAP（偏低）
     """
-    vwap  = ta.vwap(df["High"], df["Low"], df["Close"], df["Volume"]).iloc[-1]
-    rsi   = ta.rsi(df["Close"], length=14).iloc[-1]
-    price = df["Close"].iloc[-1]
+    price  = df["Close"].iloc[-1] if not df.empty else 0
+    vwap_s = ta.vwap(df["High"], df["Low"], df["Close"], df["Volume"])
+    rsi_s  = ta.rsi(df["Close"], length=14)
+    if vwap_s is None or rsi_s is None or vwap_s.empty or rsi_s.empty:
+        return Signal(code, "SKIP", "mean_reversion", price, 0, 0, "指標資料不足")
+    vwap = vwap_s.iloc[-1]
+    rsi  = rsi_s.iloc[-1]
 
     if pd.isna(vwap) or pd.isna(rsi):
         return Signal(code, "SKIP", "mean_reversion", price, 0, 0, "指標資料不足")
