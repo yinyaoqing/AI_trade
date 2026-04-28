@@ -1451,13 +1451,26 @@ class AITradingBot:
         for c in ranked:
             print(f"  {c.describe()}")
 
-        # ── 執行階段（高分優先，直到部位滿）──────────────────────
+        # ── 執行階段（高分優先，受預算與部位上限雙重限制）──────────
+        # 累計實際下單金額並扣除已委託未成交買單凍結金額，
+        # 避免單輪內連續下單造成超額買入（防違約交割）。
+        spent = 0.0
+        budget_cap = TOTAL_BUDGET - self.pending_buy_amount()
         for c in ranked:
             if len(self.positions) >= MAX_POSITIONS:
+                print(f"[掃描] 已達部位上限 {MAX_POSITIONS}，停止下單")
                 break
             if c.code in self.positions:
                 continue
+            cost = c.price * c.qty
+            if spent + cost > budget_cap:
+                print(
+                    f"[掃描] {c.code} 下單金額 {cost:,.0f}，累計將達 {spent + cost:,.0f}"
+                    f" > 可用預算 {budget_cap:,.0f}，停止下單"
+                )
+                break
             self._execute_buy(c, sentiment_score, analysis)
+            spent += cost
 
     # ------------------------------------------------------------------
     # 出場監控：移動止盈 + 強制止損
