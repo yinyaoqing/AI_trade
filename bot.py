@@ -46,7 +46,7 @@ load_dotenv()
 
 INITIAL_CAPITAL   = 46000   # 原始投入資金（元），用於計算累計損益
 TOTAL_BUDGET      = 46000   # 總預算（元）
-MAX_POSITIONS     = 4       # 最多同時持有部位數
+MAX_POSITIONS     = 10       # 最多同時持有部位數
 POSITION_SIZE     = TOTAL_BUDGET // MAX_POSITIONS  # 初始值，MIN_ORDER_VALUE 定義後由 _calc_position_size() 修正
 
 
@@ -189,12 +189,16 @@ PINNED_STOCKS: tuple[str, ...] = (
     "3585",   # 聯致
     "3363",   # 上詮
     "7769",   # 鴻勁
+    "7750"    # 新代
+    "3211"    # 順達
 )
 
 # 長期持有清單：列在此處的股票不納入止損/止盈監控，由人工決定出場時機
 # 適合基本面持股、核心持倉等不希望被短期波動觸發自動賣出的標的
 LONG_TERM_HOLD: frozenset[str] = frozenset([
     "0050",   # ★★ 元大台灣50（長期核心持倉，包含台積電等優質藍籌）
+    # "8021",    # 尖點
+    # "7750",    # 新代
     # 範例：
     # "2330",   # 台積電（長期核心持倉）
     # "0050",   # 元大台灣50
