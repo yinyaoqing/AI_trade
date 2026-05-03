@@ -46,7 +46,7 @@ load_dotenv()
 
 INITIAL_CAPITAL   = 68000   # 原始投入資金（元），用於計算累計損益
 TOTAL_BUDGET      = 46000   # 總預算（元）
-MAX_POSITIONS     = 5       # 最多同時持有部位數
+MAX_POSITIONS     = 7       # 最多同時持有部位數
 POSITION_SIZE     = TOTAL_BUDGET // MAX_POSITIONS  # 初始值，MIN_ORDER_VALUE 定義後由 _calc_position_size() 修正
 
 
