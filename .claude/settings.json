@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git -C \"c:/Users/yinya/git/AI_trade\" diff --stat HEAD)",
+      "Bash(git -C \"c:/Users/yinya/git/AI_trade\" log --oneline -5)"
+    ]
+  }
+}

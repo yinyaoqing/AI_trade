@@ -269,6 +269,7 @@ class BuyCandidate:
     stop_price:  float
     trail_price: float
     score:       float  # 排序依據：VWAP 突破幅度 × 0.5 + 法人情緒 × 0.5
+    rvol:        float = 0.0  # 相對成交量（次要排序鍵）
 
     def describe(self) -> str:
         tag = "動能" if self.strategy == "momentum" else "均值回歸"
@@ -1422,7 +1423,7 @@ class AITradingBot:
                 price=current_price, qty=qty,
                 vwap=float(vwap), rsi=rsi_val, chip_score=chip_score,
                 atr_val=atr_val, stop_price=stop_p, trail_price=trail_p,
-                score=rank_score,
+                score=rank_score, rvol=float(rvol),
             )
         except Exception as e:
             print(f"[動能/{stock_code}] 評估失敗: {e}")
@@ -1484,6 +1485,33 @@ class AITradingBot:
     def _execute_buy(self, c: "BuyCandidate", sentiment_score: float, analysis: str) -> None:
         """對已通過評估的候選標的執行買進下單，並確認成交後更新部位"""
         contract = self.api.Contracts.Stocks[c.code]
+
+        # 疑慮 2：下單前重抓現價，避免評估與下單之間的價格漂移
+        # 若漂移超過 0.5%，依方向決定動作：
+        #   上漲 → 改用新價追單（避免委託在低價無法成交）
+        #   下跌 → 跳過（避免追跌被套）
+        try:
+            snap_now = self.api.snapshots([contract])[0]
+            cur_price = float(getattr(snap_now, "close", c.price) or c.price)
+            if cur_price > 0 and c.price > 0:
+                drift = (cur_price - c.price) / c.price
+                if abs(drift) > 0.005:
+                    if drift > 0 and drift <= 0.01:
+                        # 小幅上漲（≤1%）：用新價追單
+                        print(f"[價格漂移] {c.code} 評估價={c.price} → 現價={cur_price}（{drift:+.2%}），改用現價下單")
+                        c.price = cur_price
+                        c.qty   = max(int((c.price * c.qty) / cur_price), 1)  # 維持金額一致
+                    elif drift > 0.01:
+                        # 上漲過多：評估時的訊號可能已失效，跳過
+                        print(f"[價格漂移] {c.code} 漲幅 {drift:+.2%} > 1%，訊號失效，跳過")
+                        return
+                    else:
+                        # 下跌：可能在賣壓中，跳過避免接刀
+                        print(f"[價格漂移] {c.code} 跌幅 {drift:+.2%}，避免追跌，跳過")
+                        return
+        except Exception as e:
+            print(f"[價格漂移] {c.code} 重抓 snapshot 失敗（沿用原價）: {e}")
+
         ok = self._place_odd_order(contract, c.price, c.qty, sj.constant.Action.Buy)
         if not ok:
             print(f"[買進] {c.code} 下單被拒，跳過。")
@@ -1577,6 +1605,18 @@ class AITradingBot:
             print("[掃描] 本輪無符合條件的候選標的。")
             return
 
+        # ── 疑慮 1（方案 B）：依大盤狀態給策略 prior 權重 ─────────
+        # RANGING：均值回歸 ×1.10，動能 ×0.90（盤整偏向買弱反彈）
+        # TRENDING：動能 ×1.10，均值回歸 ×0.90（趨勢偏向追強勢）
+        if alloc.regime == MarketRegime.RANGING:
+            momentum_prior, mr_prior = 0.90, 1.10
+        else:
+            momentum_prior, mr_prior = 1.10, 0.90
+        for c in candidates:
+            prior = mr_prior if c.strategy == "mean_reversion" else momentum_prior
+            c.score = c.score * prior
+        print(f"[掃描] 策略加權 動能×{momentum_prior:.2f}  均值回歸×{mr_prior:.2f}")
+
         # ── 排序階段（綜合評分高分優先）──────────────────────────
         # 同一股票若兩種策略都入選，只保留分數較高者
         best: dict[str, BuyCandidate] = {}
@@ -1584,7 +1624,17 @@ class AITradingBot:
             if c.code not in best or c.score > best[c.code].score:
                 best[c.code] = c
 
-        ranked = sorted(best.values(), key=lambda x: x.score, reverse=True)
+        # 疑慮 3：分數接近時的排序穩定性 → 加入次要排序鍵
+        # 主鍵：分數（取兩位小數，0.01 內視為平手）
+        # 次鍵：法人情緒 → RVOL → RSI 較低者（避免追漲）
+        def _composite_key(c: "BuyCandidate"):
+            return (
+                round(c.score, 2),
+                c.chip_score,
+                c.rvol,
+                -c.rsi,  # RSI 較低者優先
+            )
+        ranked = sorted(best.values(), key=_composite_key, reverse=True)
         print(f"[掃描] 候選 {len(ranked)} 檔（排序後）：")
         for c in ranked:
             print(f"  {c.describe()}")
