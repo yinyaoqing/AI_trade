@@ -488,6 +488,11 @@ class AITradingBot:
         self._pending_orders: dict[str, dict] = {}
         # 賣單部位備份：若賣單取消可恢復
         self._pending_sell_positions: dict[str, "Position"] = {}
+        # 即時成交累積（callback 寫入）：key=ordno, value=[deals]
+        self._deal_buffer: dict[str, list] = {}
+
+        # 註冊 Shioaji 委託 / 成交即時回呼
+        self._register_order_callback()
 
         # 查詢帳戶餘額，動態決定實際可用預算
         self._init_budget()
@@ -552,6 +557,77 @@ class AITradingBot:
             )
         else:
             print("[漏斗] 本日無新增標的（已全在 PINNED_STOCKS 內或未通過篩選）。")
+
+    # ------------------------------------------------------------------
+    # 委託 / 成交即時回呼：替代輪詢，秒級更新 _pending_orders
+    # ------------------------------------------------------------------
+    def _register_order_callback(self) -> None:
+        """
+        註冊 Shioaji 的 set_order_callback。每當委託狀態變化（送出/部分成交/全部成交/取消）
+        交易所即推送一筆事件，無需輪詢 list_trades。
+        """
+        def _on_order_event(stat, msg):
+            try:
+                stat_str = str(stat)
+                # OrderState.StockDeal → 實際成交
+                if "Deal" in stat_str:
+                    code   = msg.get("code", "")
+                    action = msg.get("action", "")
+                    price  = float(msg.get("price", 0))
+                    qty    = int(msg.get("quantity", 0))
+                    ordno  = msg.get("ordno", "")
+                    print(f"[即時成交] {action} {code} {qty}股 @ {price}  ordno={ordno}")
+
+                    # 累積該訂單所有成交細節，計算加權均價與已成交數量
+                    self._deal_buffer.setdefault(ordno, []).append(
+                        {"price": price, "qty": qty}
+                    )
+                    total_qty = sum(d["qty"] for d in self._deal_buffer[ordno])
+                    total_amt = sum(d["price"] * d["qty"] for d in self._deal_buffer[ordno])
+                    avg_price = total_amt / total_qty if total_qty > 0 else price
+
+                    pending = self._pending_orders.get(code)
+                    if pending and total_qty >= pending["qty"]:
+                        print(f"[即時成交] {code} 全部成交（{total_qty}/{pending['qty']}）均價 {avg_price:.2f}")
+                        # 即時更新部位（買單）
+                        if pending["action"] == "Buy" and code in self.positions:
+                            pos = self.positions[code]
+                            pos.entry_price = avg_price
+                            pos.qty = total_qty
+                            pos.stop_price  = avg_price * (1 - STOP_LOSS_PCT)
+                            pos.trail_price = avg_price * (1 + TRAILING_START)
+                            if pos.atr > 0:
+                                pos.stop_price = max(avg_price - 1.5 * pos.atr, pos.stop_price)
+                        # 解除凍結
+                        self._pending_orders.pop(code, None)
+                        self._pending_sell_positions.pop(code, None)
+                        self._deal_buffer.pop(ordno, None)
+
+                # OrderState.StockOrder → 狀態變化（含 Cancelled / PartFilled）
+                elif "Order" in stat_str:
+                    op_msg   = (msg.get("operation") or {}).get("op_msg", "") if isinstance(msg.get("operation"), dict) else ""
+                    status   = (msg.get("status") or {})
+                    status_s = str(status.get("status", "")) if isinstance(status, dict) else ""
+                    code     = (msg.get("contract") or {}).get("code", "") if isinstance(msg.get("contract"), dict) else ""
+                    if "Cancelled" in status_s and code:
+                        print(f"[即時委託] {code} 已取消  {op_msg}")
+                        info = self._pending_orders.pop(code, None)
+                        if info and info["action"] == "Sell":
+                            backup = self._pending_sell_positions.pop(code, None)
+                            if backup:
+                                self.positions[code] = backup
+                                send_notify(f"[委託追蹤] ⚠️ {code} 賣單已取消，部位恢復監控")
+                        elif info and info["action"] == "Buy" and code in self.positions:
+                            # 買單取消且未成交 → 移除尚未建立的部位記錄
+                            del self.positions[code]
+            except Exception as e:
+                print(f"[訂單回呼] 處理失敗: {e}")
+
+        try:
+            self.api.set_order_callback(_on_order_event)
+            print("[初始化] 訂單即時回呼已註冊")
+        except Exception as e:
+            print(f"[初始化] 訂單回呼註冊失敗: {e}")
 
     # ------------------------------------------------------------------
     # 零股報價訂閱：訂閱 PINNED_STOCKS BidAsk，快取最新買賣報價
