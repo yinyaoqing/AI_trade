@@ -587,9 +587,11 @@ class AITradingBot:
                     avg_price = total_amt / total_qty if total_qty > 0 else price
 
                     pending = self._pending_orders.get(code)
-                    if pending and total_qty >= pending["qty"]:
+                    is_bot_order = pending is not None
+                    fully_filled = pending and total_qty >= pending["qty"]
+
+                    if fully_filled:
                         print(f"[即時成交] {code} 全部成交（{total_qty}/{pending['qty']}）均價 {avg_price:.2f}")
-                        # 即時更新部位（買單）
                         if pending["action"] == "Buy" and code in self.positions:
                             pos = self.positions[code]
                             pos.entry_price = avg_price
@@ -598,18 +600,46 @@ class AITradingBot:
                             pos.trail_price = avg_price * (1 + TRAILING_START)
                             if pos.atr > 0:
                                 pos.stop_price = max(avg_price - 1.5 * pos.atr, pos.stop_price)
-                        # 解除凍結
                         self._pending_orders.pop(code, None)
                         self._pending_sell_positions.pop(code, None)
                         self._deal_buffer.pop(ordno, None)
 
-                # OrderState.StockOrder → 狀態變化（含 Cancelled / PartFilled）
+                    # 處理外部來源（手機 APP / 網頁 / 其他途徑）的成交
+                    if not is_bot_order:
+                        if "Buy" in action and code not in self.positions:
+                            # 手機手動買入 → 即時補入部位
+                            pos = Position(code=code, entry_price=price, qty=qty)
+                            pos.entry_time = now_tw()  # 視為今日新建，T+1 保護生效
+                            pos.stop_price  = price * (1 - STOP_LOSS_PCT)
+                            pos.trail_price = price * (1 + TRAILING_START)
+                            self.positions[code] = pos
+                            print(f"[即時成交] 外部買入 {code} {qty}股 @ {price}，已加入監控")
+                            send_notify(f"[外部買入偵測] {code} {qty}股 @ {price}，bot 已加入監控")
+                        elif "Sell" in action and code in self.positions:
+                            # 手機手動賣出 → 即時清除部位（避免 bot 繼續監控不存在的股票）
+                            pos = self.positions.pop(code)
+                            print(f"[即時成交] 外部賣出 {code} {qty}股 @ {price}，已從監控移除")
+                            send_notify(
+                                f"[外部賣出偵測] {code} {qty}股 @ {price}\n"
+                                f"成本 {pos.entry_price:.2f}  bot 已停止監控"
+                            )
+
+                # OrderState.StockOrder → 狀態變化（New / Cancel / UpdatePrice / UpdateQty）
                 elif "Order" in stat_str:
-                    op_msg   = (msg.get("operation") or {}).get("op_msg", "") if isinstance(msg.get("operation"), dict) else ""
-                    status   = (msg.get("status") or {})
-                    status_s = str(status.get("status", "")) if isinstance(status, dict) else ""
-                    code     = (msg.get("contract") or {}).get("code", "") if isinstance(msg.get("contract"), dict) else ""
-                    if "Cancelled" in status_s and code:
+                    op       = msg.get("operation") if isinstance(msg.get("operation"), dict) else {}
+                    op_type  = str(op.get("op_type", ""))
+                    op_msg   = op.get("op_msg", "")
+                    status   = msg.get("status") if isinstance(msg.get("status"), dict) else {}
+                    status_s = str(status.get("status", ""))
+                    contract = msg.get("contract") if isinstance(msg.get("contract"), dict) else {}
+                    code     = contract.get("code", "")
+                    order    = msg.get("order") if isinstance(msg.get("order"), dict) else {}
+                    new_price = float(order.get("price", 0) or 0)
+                    new_qty   = int(order.get("quantity", 0) or 0)
+
+                    if "Cancel" in op_type or "Cancelled" in status_s:
+                        if not code:
+                            return
                         print(f"[即時委託] {code} 已取消  {op_msg}")
                         info = self._pending_orders.pop(code, None)
                         if info and info["action"] == "Sell":
@@ -618,8 +648,37 @@ class AITradingBot:
                                 self.positions[code] = backup
                                 send_notify(f"[委託追蹤] ⚠️ {code} 賣單已取消，部位恢復監控")
                         elif info and info["action"] == "Buy" and code in self.positions:
-                            # 買單取消且未成交 → 移除尚未建立的部位記錄
                             del self.positions[code]
+
+                    elif "UpdatePrice" in op_type or "ChangePrice" in op_type:
+                        info = self._pending_orders.get(code)
+                        if info and new_price > 0:
+                            old_price = info["price"]
+                            info["price"]  = new_price
+                            info["amount"] = new_price * info["qty"]
+                            print(
+                                f"[即時委託] {code} 改價 {old_price:.2f} → {new_price:.2f}"
+                                f"  新凍結 {info['amount']:,.0f} 元"
+                            )
+                            send_notify(
+                                f"[委託改價] {code}\n"
+                                f"{old_price:.2f} → {new_price:.2f}  ({info['action']} {info['qty']}股)"
+                            )
+
+                    elif "UpdateQty" in op_type or "ChangeQty" in op_type:
+                        info = self._pending_orders.get(code)
+                        if info and new_qty > 0:
+                            old_qty = info["qty"]
+                            info["qty"]    = new_qty
+                            info["amount"] = info["price"] * new_qty
+                            print(
+                                f"[即時委託] {code} 改量 {old_qty} → {new_qty} 股"
+                                f"  新凍結 {info['amount']:,.0f} 元"
+                            )
+                            send_notify(
+                                f"[委託改量] {code}\n"
+                                f"{old_qty} → {new_qty} 股  ({info['action']} @ {info['price']})"
+                            )
             except Exception as e:
                 print(f"[訂單回呼] 處理失敗: {e}")
 
