@@ -643,13 +643,28 @@ class AITradingBot:
                             return
                         print(f"[即時委託] {code} 已取消  {op_msg}")
                         info = self._pending_orders.pop(code, None)
-                        if info and info["action"] == "Sell":
-                            backup = self._pending_sell_positions.pop(code, None)
-                            if backup:
-                                self.positions[code] = backup
-                                send_notify(f"[委託追蹤] ⚠️ {code} 賣單已取消，部位恢復監控")
-                        elif info and info["action"] == "Buy" and code in self.positions:
-                            del self.positions[code]
+                        # 統一推播取消通知（含金額、原因）
+                        if info:
+                            act_zh = "買單" if info["action"] == "Buy" else "賣單"
+                            reason = f"  原因：{op_msg}" if op_msg else ""
+                            notify_lines = [
+                                f"[委託取消] ⚠️ {code} {act_zh}已取消",
+                                f"委託：{info['qty']} 股 @ {info['price']}  金額 {info['amount']:,.0f} 元",
+                            ]
+                            if info["action"] == "Sell":
+                                backup = self._pending_sell_positions.pop(code, None)
+                                if backup:
+                                    self.positions[code] = backup
+                                    notify_lines.append("→ 部位已恢復監控")
+                            elif info["action"] == "Buy" and code in self.positions:
+                                del self.positions[code]
+                                notify_lines.append("→ 部位記錄已移除")
+                            if reason:
+                                notify_lines.append(reason.strip())
+                            send_notify("\n".join(notify_lines))
+                        else:
+                            # 非 bot 下的委託（手機 APP 直接下單後取消）
+                            send_notify(f"[委託取消] ⚠️ {code} 委託已取消（外部來源）{op_msg}")
 
                     elif "UpdatePrice" in op_type or "ChangePrice" in op_type:
                         info = self._pending_orders.get(code)
