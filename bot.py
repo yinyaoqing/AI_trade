@@ -57,7 +57,7 @@ TRAILING_ATR_MULT    = 0.6     # 動態回撤：從最高點回落 0.6×ATR 時�
 BREAKEVEN_TRIGGER    = 0.02    # 成本保衛：獲利達 2% 時自動將止損上移至成本價
 TIME_STOP_BDAYS      = 5       # 時間停損：持有超過 N 個工作天仍未觸發其他出場條件 → 強制出場，釋放資金
 SLIPPAGE_LIMIT       = 0.01    # 滑點保護：買賣價差 > 1%（零股市場天生價差較大，原 0.5% 過嚴）
-MIN_ORDER_VALUE      = 9_000   # 最小下單金額（元）：確保手續費占比 < 0.1%，避免最低手續費侵蝕獲利
+MIN_ORDER_VALUE      = 11_000   # 最小下單金額（元）：確保手續費占比 < 0.1%，避免最低手續費侵蝕獲利
 
 
 def _business_days_between(start_date, end_date) -> int:
