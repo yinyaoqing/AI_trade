@@ -503,6 +503,8 @@ class AITradingBot:
         self._pending_sell_positions: dict[str, "Position"] = {}
         # 即時成交累積（callback 寫入）：key=ordno, value=[deals]
         self._deal_buffer: dict[str, list] = {}
+        # 違約交割警告冷卻：上次推播時間
+        self._last_critical_alert: float = 0.0
 
         # 註冊 Shioaji 委託 / 成交即時回呼
         self._register_order_callback()
@@ -821,7 +823,29 @@ class AITradingBot:
 
             # 安全警告：單筆預算低於最小下單金額時無法進場
             warn_msg = ""
-            if POSITION_SIZE < MIN_ORDER_VALUE:
+            critical_alert = ""
+            if TOTAL_BUDGET < 0:
+                # 預算為負 → 違約交割風險，30 分鐘冷卻內不重複推播
+                CRITICAL_COOLDOWN = 1800
+                shortfall = -TOTAL_BUDGET
+                critical_alert = (
+                    f"🚨【違約交割風險】🚨\n"
+                    f"安全可動用現金為負值：{TOTAL_BUDGET:,.0f} 元\n"
+                    f"缺口：{shortfall:,.0f} 元\n"
+                    f"帳戶餘額 {acc_balance:,.0f}，未來應付 {net_settlement:+,.0f}\n"
+                    f"⚠️ 請立即執行以下任一動作：\n"
+                    f"  1. 匯款補足至少 {shortfall + 2000:,.0f} 元（含 2,000 緩衝）\n"
+                    f"  2. 手動賣出獲利部位變現\n"
+                    f"  3. 確認是否有應收款項即將入帳"
+                )
+                print(f"[預算] {critical_alert}")
+                if time.time() - self._last_critical_alert >= CRITICAL_COOLDOWN:
+                    send_notify(critical_alert)
+                    self._last_critical_alert = time.time()
+                else:
+                    remain = CRITICAL_COOLDOWN - (time.time() - self._last_critical_alert)
+                    print(f"[預算] 違約警告冷卻中（剩 {remain:.0f}s），跳過推播")
+            elif POSITION_SIZE < MIN_ORDER_VALUE:
                 warn_msg = (
                     f"\n⚠️ 單筆預算 {POSITION_SIZE:,} 元 < 最低下單 {MIN_ORDER_VALUE:,} 元，無法進場。"
                     f"\n建議帳戶至少 {MIN_ORDER_VALUE * MAX_POSITIONS:,} 元。"
@@ -1667,10 +1691,17 @@ class AITradingBot:
             print(f"  {c.describe()}")
 
         # ── 執行階段（高分優先，受預算與部位上限雙重限制）──────────
+        # 下單前強制刷新預算：避免 TOTAL_BUDGET 沿用啟動時的舊值
+        # （settlements 反映買入需 T+1/T+2，10 分鐘 refresh 太慢可能跨輪超買）
+        self._init_budget()
+
         # 累計實際下單金額並扣除已委託未成交買單凍結金額，
         # 避免單輪內連續下單造成超額買入（防違約交割）。
         spent = 0.0
         budget_cap = TOTAL_BUDGET - self.pending_buy_amount()
+        if budget_cap <= 0:
+            print(f"[掃描] 可用預算 {budget_cap:,.0f} 已歸零，停止下單")
+            return
         for c in ranked:
             if len(self.positions) >= MAX_POSITIONS:
                 print(f"[掃描] 已達部位上限 {MAX_POSITIONS}，停止下單")
