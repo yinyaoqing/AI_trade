@@ -116,8 +116,11 @@ ATR_MAX_PCT        = 0.03    # ATR 過熱保護：ATR/股價 > 3% 視為跳空�
 MA_TREND_PERIOD    = 50      # 趨勢過濾均線：個股現價需在 MA50 之上才進場（回測驗證有效）
 MARKET_INDEX       = "0050"  # 大盤指數代碼（主板用 0050，中小型股可改 0051）
 
-SCAN_INTERVAL          = 60    # 主循環間隔（秒）
-NEWS_DIGEST_INTERVAL   = 1800  # 非交易時間新聞推播間隔（秒）
+SCAN_INTERVAL           = 60    # 主循環間隔（秒）
+NEWS_DIGEST_INTERVAL    = 1800  # 非交易時間新聞推播間隔（秒）
+PENDING_ORDER_TIMEOUT   = 600   # 委託逾時自動撤單（秒）：超過此時間未成交則向交易所送出取消
+BUDGET_REFRESH_INTERVAL = 600   # 預算重查間隔（秒）：每 N 秒重查 settlements() 並推播
+STATUS_REPORT_INTERVAL  = 1800  # 部位狀態推播間隔（秒）：每 N 秒推播委託 + 部位狀態
 
 # 漏斗掃描觸發時間（每日一次，開盤 15 分鐘後）
 FUNNEL_SCAN_HOUR   = 9    # 09:20 觸發
@@ -812,6 +815,9 @@ class AITradingBot:
             # 扣除委託中但未成交的買單凍結金額
             frozen = self.pending_buy_amount()
             available = acc_balance + net_settlement - frozen
+
+            # 暴露給 scan_candidates 作嚴格現金檢查使用
+            self._acc_balance_cache = acc_balance
 
             TOTAL_BUDGET   = available
             POSITION_SIZE  = _calc_position_size(TOTAL_BUDGET)
@@ -1709,24 +1715,44 @@ class AITradingBot:
         # （settlements 反映買入需 T+1/T+2，10 分鐘 refresh 太慢可能跨輪超買）
         self._init_budget()
 
-        # 累計實際下單金額並扣除已委託未成交買單凍結金額，
-        # 避免單輪內連續下單造成超額買入（防違約交割）。
+        # ── 雙層預算保護 ─────────────────────────────────────────
+        # 1) budget_cap：TOTAL_BUDGET - pending 凍結（含未來淨額預估）
+        # 2) strict_cap：acc_balance - pending - 今日已成交買單成本
+        #                以實際帳戶餘額為最後防線，settlements 延遲也不會超買
         spent = 0.0
-        budget_cap = TOTAL_BUDGET - self.pending_buy_amount()
-        if budget_cap <= 0:
-            print(f"[掃描] 可用預算 {budget_cap:,.0f} 已歸零，停止下單")
+        pending_amt = self.pending_buy_amount()
+        budget_cap = TOTAL_BUDGET - pending_amt
+
+        today_buy_cost = sum(
+            pos.entry_price * pos.qty
+            for pos in self.positions.values()
+            if pos.entry_time.date() == now_tw().date()
+        )
+        acc_bal = getattr(self, "_acc_balance_cache", 0.0)
+        strict_cap = acc_bal - pending_amt - today_buy_cost
+        effective_cap = min(budget_cap, strict_cap)
+        print(
+            f"[掃描] 預算上限 budget={budget_cap:,.0f}  "
+            f"嚴格={strict_cap:,.0f}（acc {acc_bal:,.0f} - 凍結 {pending_amt:,.0f} "
+            f"- 今日已買 {today_buy_cost:,.0f}）  → 採用 {effective_cap:,.0f}"
+        )
+
+        if effective_cap <= 0:
+            print(f"[掃描] 可用預算 {effective_cap:,.0f} 已歸零，停止下單")
             return
+
         for c in ranked:
-            if len(self.positions) >= MAX_POSITIONS:
-                print(f"[掃描] 已達部位上限 {MAX_POSITIONS}，停止下單")
+            active_slots, occupied = self.effective_slots()
+            if active_slots >= MAX_POSITIONS:
+                print(f"[掃描] 已達部位上限 {MAX_POSITIONS}（含委託中），停止下單")
                 break
-            if c.code in self.positions:
+            if c.code in occupied:
                 continue
             cost = c.price * c.qty
-            if spent + cost > budget_cap:
+            if spent + cost > effective_cap:
                 print(
                     f"[掃描] {c.code} 下單金額 {cost:,.0f}，累計將達 {spent + cost:,.0f}"
-                    f" > 可用預算 {budget_cap:,.0f}，停止下單"
+                    f" > 可用預算 {effective_cap:,.0f}，停止下單"
                 )
                 break
             self._execute_buy(c, sentiment_score, analysis)
@@ -2081,19 +2107,50 @@ class AITradingBot:
                     # 賣單未成交但部位已被移除 → 發出警告
                     print(f"[委託追蹤] ⚠️ {code} 賣單未成交（{deal_qty}/{order_qty}），部位已移除")
 
-        # 超時安全閥：委託超過 10 分鐘仍未 resolve，強制清除
-        PENDING_TIMEOUT = 600
+        # 超時自動取消：委託超過 PENDING_ORDER_TIMEOUT 秒仍未成交 → 呼叫 cancel_order 取消
+        # 真正向交易所撤單，釋放凍結資金（單純從追蹤移除無法解除券商端凍結）
         now_ts = time.time()
         for code, info in list(self._pending_orders.items()):
             if code in resolved:
                 continue
             age = now_ts - info.get("created_at", now_ts)
-            if age > PENDING_TIMEOUT:
-                print(f"[委託追蹤] {info['action']} {code} 超過 {PENDING_TIMEOUT}s 未確認，強制解除凍結")
-                resolved.append(code)
+            if age > PENDING_ORDER_TIMEOUT:
+                trade_obj = info.get("trade")
+                act_str   = info["action"]
+                try:
+                    if trade_obj is not None:
+                        self.api.cancel_order(trade_obj)
+                        print(f"[委託追蹤] {act_str} {code} 超過 {PENDING_ORDER_TIMEOUT}s 未成交，已送出取消")
+                        send_notify(
+                            f"[委託逾時取消] ⏱️ {code}\n"
+                            f"{act_str} {info['qty']}股 @ {info['price']}  金額 {info['amount']:,.0f} 元\n"
+                            f"持續 {age:.0f} 秒未成交，已自動撤單"
+                        )
+                        # 不在這裡 resolved.append → 等 callback Cancelled 事件處理
+                        # 若 callback 漏接，下一輪 sync 仍會嘗試取消（重複 cancel 無害）
+                    else:
+                        # 沒有 trade 物件就無法撤單，只能清除追蹤
+                        print(f"[委託追蹤] {act_str} {code} 超時但無 trade 物件，強制解除凍結")
+                        resolved.append(code)
+                except Exception as e:
+                    print(f"[委託追蹤] {act_str} {code} 超時撤單失敗: {e}，強制解除凍結")
+                    resolved.append(code)
 
         for code in resolved:
             del self._pending_orders[code]
+
+    def effective_slots(self) -> tuple[int, set[str]]:
+        """
+        計算實際佔用的部位 slot 數量。
+        包含：
+          - 已成交持倉（self.positions）
+          - 未成交買單（_pending_orders Buy，避免短時間連續超買）
+          - 未確認賣單（_pending_orders Sell，slot 尚未真正釋放）
+        相同 code 在不同集合只算 1 次。
+        回傳 (slot 數, 佔用 code 集合)
+        """
+        occupied = set(self.positions.keys()) | set(self._pending_orders.keys())
+        return len(occupied), occupied
 
     def pending_buy_amount(self) -> float:
         """回傳所有委託中買單的凍結金額"""
@@ -2319,8 +2376,6 @@ if __name__ == "__main__":
     last_digest_sent: float = time.time()
     last_budget_refresh: float = time.time()
     last_status_report: float = time.time()
-    BUDGET_REFRESH_INTERVAL = 600    # 每 10 分鐘重查 settlements() 更新預算
-    STATUS_REPORT_INTERVAL  = 1800   # 每 30 分鐘推播委託 + 部位狀態
 
     try:
         while True:
@@ -2353,11 +2408,15 @@ if __name__ == "__main__":
                 # 漏斗掃描（09:20 每日一次，更新當日監控清單）
                 bot.run_funnel_if_needed()
 
-                # 滿倉檢查：持倉 + 待確認賣單（slot 尚未釋放）達 MAX_POSITIONS 時跳過
-                pending_sells = len([v for v in bot._pending_orders.values() if v["action"] == "Sell"])
-                active_slots  = len(bot.positions) + pending_sells
+                # 滿倉檢查：持倉 + 委託中（買單+賣單）達 MAX_POSITIONS 時跳過
+                active_slots, occupied_codes = bot.effective_slots()
                 if active_slots >= MAX_POSITIONS:
-                    print(f"[策略] 已佔 {active_slots} 檔（持倉 {len(bot.positions)} + 待賣 {pending_sells}，上限 {MAX_POSITIONS}），跳過進場掃描。")
+                    pending_buys  = len([v for v in bot._pending_orders.values() if v["action"] == "Buy"])
+                    pending_sells = len([v for v in bot._pending_orders.values() if v["action"] == "Sell"])
+                    print(
+                        f"[策略] 已佔 {active_slots} 檔（持倉 {len(bot.positions)} "
+                        f"+ 待買 {pending_buys} + 待賣 {pending_sells}，上限 {MAX_POSITIONS}），跳過進場掃描。"
+                    )
                     time.sleep(SCAN_INTERVAL)
                     continue
 
