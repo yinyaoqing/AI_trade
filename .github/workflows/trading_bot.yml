@@ -2,8 +2,10 @@ name: AI Trade Bot
 
 on:
   schedule:
-    # 每週一至五 00:50 UTC = 台灣時間 08:50，開盤前啟動
-    - cron: '50 0 * * 1-5'
+    # 每週一至五 00:20 UTC = 台灣時間 08:20，提早 45 分鐘啟動
+    # （GitHub Actions cron 常延遲 5~40 分鐘，加上 pip install + 登入需 ~9 分鐘
+    #  提早觸發可確保 09:05 開盤前完成初始化）
+    - cron: '20 0 * * 1-5'
   workflow_dispatch:
     inputs:
       reason:
@@ -15,7 +17,8 @@ jobs:
   trading-bot:
     name: 執行模擬交易機器人
     runs-on: ubuntu-latest
-    timeout-minutes: 300   # 5 小時上限，涵蓋完整交易時段（09:05-13:25 CST）
+    timeout-minutes: 340   # 5.7 小時，從 08:20 啟動算起涵蓋至 14:00 CST
+                           # （含 cron 延遲緩衝 + 收盤後 daily_summary 推播）
 
     steps:
       - name: Checkout 程式碼

@@ -491,6 +491,9 @@ class AITradingBot:
         self._market_trend_up: bool = False      # 大盤趨勢狀態（含遲滯帶）
         self.funnel = FunnelScanner(self.api, get_ai_sentiment)                  # 漏斗掃描器
         self._funnel_done_today: bool = False    # 當日是否已執行漏斗掃描
+        # 賣出冷卻：key=stock_code, value=可重新買入的最早時間（epoch）
+        # 一般冷卻 30 分鐘；若為跳空止損則延長至次日 09:30
+        self._sell_cooldown: dict[str, float] = {}
 
         # 零股即時報價快取：key=股票代碼, value=(bid, ask)
         # 由 _subscribe_odd_quotes() 持續更新，check_slippage_safe() 優先使用
@@ -1628,10 +1631,21 @@ class AITradingBot:
         from src.ai_trade.strategy import MarketRegime
         candidates: list[BuyCandidate] = []
 
+        # 清除已過期的賣出冷卻記錄
+        now_ts = time.time()
+        expired = [k for k, v in self._sell_cooldown.items() if v <= now_ts]
+        for k in expired:
+            del self._sell_cooldown[k]
+
         # ── 評估階段（全部掃完）──────────────────────────────────
         for code in watch_list:
             if code in self.positions:
                 print(f"[{code}] 已持有，跳過。")
+                continue
+            if code in self._sell_cooldown:
+                remain = self._sell_cooldown[code] - now_ts
+                hrs, mins = divmod(int(remain) // 60, 60)
+                print(f"[{code}] 賣出冷卻中（剩 {hrs}時{mins}分），跳過。")
                 continue
             if alloc.regime == MarketRegime.RANGING:
                 mr_budget = POSITION_SIZE * alloc.mean_reversion_budget_pct
@@ -1762,9 +1776,20 @@ class AITradingBot:
             reason = None
 
             # ── A. ATR 自適應止損 ────────────────────────────────────
+            # 早盤跳空保護：09:05~09:20 跌破止損價但虧損 ≤ 5% 時，
+            # 視為開盤雜訊，延後止損等待價格穩定。
+            # 虧損 > 5% 仍視為嚴重利空，立即執行止損保護。
+            now_ts = now_tw()
+            in_early_market = (now_ts.hour == 9 and now_ts.minute < 20)
             if current <= pos.stop_price:
-                reason = (f"止損（現價{current} ≤ 止損價{pos.stop_price:.2f}，"
-                          f"虧損{profit:.2%}，ATR={pos.atr:.2f}）")
+                if in_early_market and profit > -0.05:
+                    print(
+                        f"[早盤保護] {code} 跌破止損但虧損 {profit:.2%} ≤ 5%，"
+                        f"延後至 09:20 後再判斷"
+                    )
+                else:
+                    reason = (f"止損（現價{current} ≤ 止損價{pos.stop_price:.2f}，"
+                              f"虧損{profit:.2%}，ATR={pos.atr:.2f}）")
 
             # ── B. 成本保衛（Break-even Stop）────────────────────────
             # 獲利達 BREAKEVEN_TRIGGER 後，止損價自動上移至進場成本（不再允許虧損）
@@ -1832,6 +1857,26 @@ class AITradingBot:
         # 若賣單被取消，_sync_pending_orders 會將部位恢復
         self._pending_sell_positions[code] = pos
         del self.positions[code]
+
+        # 賣出冷卻：避免賣完立刻買回造成鋸齒交易
+        # 跳空止損（開盤 09:05~09:30 觸發 + 虧損 >2.5%）→ 冷卻至次日 09:30
+        # 一般出場 → 冷卻 30 分鐘
+        now_dt = now_tw()
+        is_gap_stop = (
+            "止損" in reason
+            and profit_pct < -0.025
+            and (now_dt.hour == 9 and now_dt.minute <= 30)
+        )
+        if is_gap_stop:
+            next_day_open = (now_dt + timedelta(days=1)).replace(
+                hour=9, minute=30, second=0, microsecond=0
+            )
+            self._sell_cooldown[code] = next_day_open.timestamp()
+            cooldown_desc = f"跳空止損 → 冷卻至明日 09:30"
+        else:
+            self._sell_cooldown[code] = time.time() + 1800   # 30 分鐘
+            cooldown_desc = "一般出場 → 冷卻 30 分鐘"
+        print(f"[賣出冷卻] {code}  {cooldown_desc}")
         fill_note = ""
         if fill and fill["deal_qty"] > 0 and abs(actual_price - price) > 0.01:
             fill_note = f"\n實際成交：{actual_qty}股 @ {actual_price:.2f}"
@@ -2313,6 +2358,14 @@ if __name__ == "__main__":
                 active_slots  = len(bot.positions) + pending_sells
                 if active_slots >= MAX_POSITIONS:
                     print(f"[策略] 已佔 {active_slots} 檔（持倉 {len(bot.positions)} + 待賣 {pending_sells}，上限 {MAX_POSITIONS}），跳過進場掃描。")
+                    time.sleep(SCAN_INTERVAL)
+                    continue
+
+                # 早盤過濾：09:05~09:20 不執行進場掃描
+                # 開盤初期跳空、撮合不穩定，避免追跳空後反彈被套
+                # （monitor_exit 仍正常執行，止損保護不受影響）
+                if now.hour == 9 and now.minute < 20:
+                    print(f"[策略] 早盤過濾（{now.strftime('%H:%M')} < 09:20），跳過進場掃描")
                     time.sleep(SCAN_INTERVAL)
                     continue
 
