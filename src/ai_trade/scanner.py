@@ -28,9 +28,12 @@ if TYPE_CHECKING:
 # 參數
 # ---------------------------------------------------------------------------
 
-LIQUIDITY_SCANNER_COUNT = 100   # Layer 1：取成交金額前 N 名
-MIN_VOLUME_K            = 3000  # Layer 1：5 日均量下限（張）
-MIN_AMOUNT              = 5e8   # Layer 1：5 日均金額下限（元）
+LIQUIDITY_SCANNER_COUNT = 100   # Layer 1：每種 scanner 取前 N 名
+MIN_VOLUME_K            = 500   # Layer 1：5 日均量下限（張，放寬讓中小型股可進）
+MIN_AMOUNT              = 1e8   # Layer 1：5 日均金額下限（元，放寬至 1 億）
+RVOL_MIN_LAYER1         = 1.5   # Layer 1：今日 RVOL 下限（爆量倍數）
+RVOL_MAX_LAYER1         = 10.0  # Layer 1：RVOL 上限（避免過度炒作）
+LAYER1_TOP_N            = 50    # Layer 1：通過後最終取前 N 名（依綜合分排序）
 
 OPEN_15MIN_VOL_RATIO    = 0.20  # Layer 2：開盤 15 分鐘量 ≥ 昨日全天 20%
 GAIN_MIN                = 0.02  # Layer 2：漲幅下限 2%
@@ -78,50 +81,101 @@ class FunnelScanner:
         self.sentiment_fn = sentiment_fn   # get_ai_sentiment(news_text) -> (float, str)
 
     # ------------------------------------------------------------------
-    # Layer 1：流動性漏斗
+    # Layer 1：多維度熱絡度漏斗
     # ------------------------------------------------------------------
     def layer1_liquidity(self) -> list[str]:
         """
-        用 Shioaji AmountRank scanner 取成交金額前 N 名，
-        再用 5 日 kbar 驗證均量 / 均額是否達標。
-        回傳通過的股票代號清單。
+        三種 scanner 聯集 → 流動性過濾 → RVOL 評分排序 → 取前 N 名
+
+        資料來源（聯集）：
+          - AmountRank：成交金額排行（傳統流動性）
+          - VolumeRank：成交量排行（小型股優勢）
+          - ChangePercentRank：漲跌幅排行（題材股捕捉）
+
+        過濾條件：
+          - 5 日均量 ≥ MIN_VOLUME_K 張 OR 均金額 ≥ MIN_AMOUNT
+          - RVOL（今日量/20日均量）介於 [1.5, 10]
+
+        排序：
+          綜合分 = log(成交金額)×0.3 + min(RVOL/5,1)×0.4 + |漲幅|×0.3
         """
-        print(f"[Layer1] 掃描成交金額前 {LIQUIDITY_SCANNER_COUNT} 名...")
-        try:
-            items = self.api.scanners(
-                scanner_type=sj.constant.ScannerType.AmountRank,
-                ascending=False,
-                count=LIQUIDITY_SCANNER_COUNT,
-                timeout=30000,
-            )
-        except Exception as e:
-            print(f"[Layer1] scanner 失敗: {e}")
-            return []
-
-        candidates = [item.code for item in items if item.code]
-        print(f"[Layer1] scanner 回傳 {len(candidates)} 檔，驗證 5 日均量...")
-
-        passed = []
-        today = datetime.now().strftime("%Y-%m-%d")
-        five_days_ago = (datetime.now() - timedelta(days=10)).strftime("%Y-%m-%d")
-
-        for code in candidates:
+        # === 1. 三種 scanner 聯集 ===
+        all_codes: set[str] = set()
+        scanner_specs = [
+            ("AmountRank",        sj.constant.ScannerType.AmountRank),
+            ("VolumeRank",        sj.constant.ScannerType.VolumeRank),
+            ("ChangePercentRank", sj.constant.ScannerType.ChangePercentRank),
+        ]
+        for label, st in scanner_specs:
             try:
-                contract = self.api.Contracts.Stocks[code]
-                kbars = self.api.kbars(contract, start=five_days_ago, end=today)
-                df = pd.DataFrame({**kbars.model_dump()})
-                if df.empty:
-                    continue
-                avg_vol    = df["Volume"].tail(5).mean() / 1000  # 張
-                avg_amount = (df["Close"] * df["Volume"]).tail(5).mean()
+                items = self.api.scanners(
+                    scanner_type=st,
+                    ascending=False,
+                    count=LIQUIDITY_SCANNER_COUNT,
+                    timeout=30000,
+                )
+                got = [it.code for it in items if it.code]
+                all_codes.update(got)
+                print(f"[Layer1] {label}: {len(got)} 檔")
+                time.sleep(RATE_LIMIT_DELAY)
+            except Exception as e:
+                print(f"[Layer1] {label} scanner 失敗: {e}")
 
-                if avg_vol >= MIN_VOLUME_K or avg_amount >= MIN_AMOUNT:
-                    passed.append(code)
+        print(f"[Layer1] 三 scanner 聯集 → {len(all_codes)} 檔，計算 RVOL 與綜合分...")
+
+        # === 2. 對每檔計算 RVOL + 流動性過濾 + 綜合分 ===
+        import math
+        today = datetime.now().strftime("%Y-%m-%d")
+        start_d = (datetime.now() - timedelta(days=45)).strftime("%Y-%m-%d")
+
+        scored: list[tuple[float, str]] = []  # (score, code)
+        for code in all_codes:
+            try:
+                contract = self.api.Contracts.Stocks.get(code)
+                if not contract:
+                    continue
+                kbars = self.api.kbars(contract, start=start_d, end=today)
+                df = pd.DataFrame({**kbars.model_dump()})
+                if df.empty or len(df) < 21:
+                    continue
+
+                # 流動性下限
+                avg_vol    = df["Volume"].tail(5).mean() / 1000
+                avg_amount = (df["Close"] * df["Volume"]).tail(5).mean()
+                if avg_vol < MIN_VOLUME_K and avg_amount < MIN_AMOUNT:
+                    continue
+
+                # RVOL：今日成交量 / 過去 20 日（不含今日）均量
+                today_vol = df["Volume"].iloc[-1]
+                past20_vol = df["Volume"].iloc[-21:-1].mean()
+                if past20_vol <= 0:
+                    continue
+                rvol = today_vol / past20_vol
+                if not (RVOL_MIN_LAYER1 <= rvol <= RVOL_MAX_LAYER1):
+                    continue
+
+                # 漲幅
+                ref_price = df["Close"].iloc[-2]
+                cur_price = df["Close"].iloc[-1]
+                gain = abs(cur_price - ref_price) / ref_price if ref_price > 0 else 0
+
+                # 綜合分
+                amt_norm  = math.log10(max(avg_amount, 1)) / 11   # 1e11 ≈ 1.0
+                rvol_norm = min(rvol / 5.0, 1.0)
+                score = amt_norm * 0.3 + rvol_norm * 0.4 + min(gain, 0.1) * 3.0
+
+                scored.append((score, code))
                 time.sleep(RATE_LIMIT_DELAY)
             except Exception:
                 continue
 
-        print(f"[Layer1] 通過流動性過濾：{len(passed)} 檔")
+        # === 3. 取前 N 名 ===
+        scored.sort(key=lambda x: x[0], reverse=True)
+        passed = [c for _, c in scored[:LAYER1_TOP_N]]
+        print(f"[Layer1] 通過熱絡度過濾：{len(passed)} 檔（取前 {LAYER1_TOP_N}）")
+        if passed[:10]:
+            top10 = [f"{c}({s:.2f})" for s, c in scored[:10]]
+            print(f"[Layer1] 前 10 名：{', '.join(top10)}")
         return passed
 
     # ------------------------------------------------------------------
