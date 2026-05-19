@@ -817,7 +817,9 @@ class AITradingBot:
             available = acc_balance + net_settlement - frozen
 
             # 暴露給 scan_candidates 作嚴格現金檢查使用
-            self._acc_balance_cache = acc_balance
+            self._acc_balance_cache    = acc_balance
+            self._future_payable_cache = payable      # 未來應付（負值）
+            self._future_recv_cache    = receivable   # 未來應收（正值）
 
             TOTAL_BUDGET   = available
             POSITION_SIZE  = _calc_position_size(TOTAL_BUDGET)
@@ -1716,9 +1718,9 @@ class AITradingBot:
         self._init_budget()
 
         # ── 雙層預算保護 ─────────────────────────────────────────
-        # 1) budget_cap：TOTAL_BUDGET - pending 凍結（含未來淨額預估）
-        # 2) strict_cap：acc_balance - pending - 今日已成交買單成本
-        #                以實際帳戶餘額為最後防線，settlements 延遲也不會超買
+        # 1) budget_cap：TOTAL_BUDGET - pending 凍結（含未來淨額預估，最樂觀）
+        # 2) strict_cap：acc + 未來應收 + 未來應付 - pending - 今日已成交買單
+        #                以實際現金流為基礎，避免今日買單尚未進入 settlements 造成超買
         spent = 0.0
         pending_amt = self.pending_buy_amount()
         budget_cap = TOTAL_BUDGET - pending_amt
@@ -1728,12 +1730,15 @@ class AITradingBot:
             for pos in self.positions.values()
             if pos.entry_time.date() == now_tw().date()
         )
-        acc_bal = getattr(self, "_acc_balance_cache", 0.0)
-        strict_cap = acc_bal - pending_amt - today_buy_cost
+        acc_bal       = getattr(self, "_acc_balance_cache", 0.0)
+        future_recv   = getattr(self, "_future_recv_cache", 0.0)
+        future_pay    = getattr(self, "_future_payable_cache", 0.0)
+        strict_cap = acc_bal + future_recv + future_pay - pending_amt - today_buy_cost
         effective_cap = min(budget_cap, strict_cap)
         print(
             f"[掃描] 預算上限 budget={budget_cap:,.0f}  "
-            f"嚴格={strict_cap:,.0f}（acc {acc_bal:,.0f} - 凍結 {pending_amt:,.0f} "
+            f"嚴格={strict_cap:,.0f}（acc {acc_bal:,.0f} + 應收 {future_recv:+,.0f} "
+            f"+ 應付 {future_pay:+,.0f} - 凍結 {pending_amt:,.0f} "
             f"- 今日已買 {today_buy_cost:,.0f}）  → 採用 {effective_cap:,.0f}"
         )
 
