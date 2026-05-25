@@ -454,175 +454,76 @@ class AITradingBot:
         secret_key = os.environ["SECRET_KEY"].strip()
 
         print(f"[初始化] 嘗試登入（API_KEY 長度={len(api_key)}，SECRET_KEY 長度={len(secret_key)}）")
-        # fetch_contract=True：由 Shioaji 內部一次完成 login + 合約下載
-        # 避免「login 後背景訂閱 APISUB/V1/SYS/CONTRACT」與「我們手動 fetch_contracts」競爭
+        # Shioaji 1.5.0：login(fetch_contract=True, contracts_timeout=N) 一次完成登入 + 合約下載
+        # contracts_timeout 讓 login 阻塞等待合約完整載入，避免後續打 fetch_contracts 觸發
+        # APISUB/V1/SYS/CONTRACT concurrent 衝突。timeout=0 為非阻塞，這裡用 30 秒等候。
         accounts = self.api.login(
             api_key=api_key,
             secret_key=secret_key,
             fetch_contract=True,
+            contracts_timeout=30000,
+            contracts_cb=lambda security_type: print(
+                f"[初始化][contracts_cb] {security_type} 載入完成"
+            ),
         )
         print(f"[初始化] 登入回應：{accounts}")
 
         # 檢查合約是否已透過 login 載入（避免重複下載觸發 concurrent 衝突）
-        # 完整載入後台股應有 2,000+ 檔（TWSE ~1,000 + OTC ~800 + ETF + 興櫃）
-        # 低於 MIN_CONTRACT_COUNT 視為不完整，仍進入重試流程
-        MIN_CONTRACT_COUNT = 1500
+        # Shioaji 1.5.0：login(contracts_timeout=30000) 已阻塞等候合約載入
+        # 用 PINNED_STOCKS 抽樣驗證合約是否可用（ContractCategory 不支援 iter/len）
         contracts_loaded = False
-        # 環境診斷：版本、屬性、可用方法
+        # 環境診斷
         try:
             import shioaji as _sj
-            sj_ver = getattr(_sj, "__version__", "unknown")
-            print(f"[初始化][診斷] Shioaji 版本: {sj_ver}")
+            print(f"[初始化][診斷] Shioaji 版本: {getattr(_sj, '__version__', 'unknown')}")
         except Exception as e:
             print(f"[初始化][診斷] 取得 Shioaji 版本失敗: {e}")
         try:
-            import pysolace as _ps
-            ps_ver = getattr(_ps, "__version__", "unknown")
-            print(f"[初始化][診斷] pysolace 版本: {ps_ver}")
+            status = getattr(self.api.Contracts, "status", "unknown")
+            print(f"[初始化][診斷] Contracts.status = {status}")
+            if str(status).endswith("Fetched"):
+                contracts_loaded = True
         except Exception as e:
-            print(f"[初始化][診斷] 取得 pysolace 版本失敗: {e}")
-        try:
-            ct_type = type(self.api.Contracts).__name__
-            stk_type = type(self.api.Contracts.Stocks).__name__
-            print(f"[初始化][診斷] Contracts 類型: {ct_type}, Contracts.Stocks 類型: {stk_type}")
-            # 列出 Contracts.Stocks 的可用方法（找出計數方式）
-            attrs = [a for a in dir(self.api.Contracts.Stocks) if not a.startswith("_")][:20]
-            print(f"[初始化][診斷] Contracts.Stocks 公開屬性: {attrs}")
-        except Exception as e:
-            print(f"[初始化][診斷] Contracts 型別檢查失敗: {type(e).__name__}: {e}")
+            print(f"[初始化][診斷] 取得 Contracts.status 失敗: {e}")
 
-        # 嘗試多種計數方式
-        for method_name, counter in [
-            ("sum(1 for _ in Stocks)",   lambda: sum(1 for _ in self.api.Contracts.Stocks)),
-            ("len(Stocks)",              lambda: len(self.api.Contracts.Stocks)),
-            ("len(Stocks.keys())",       lambda: len(self.api.Contracts.Stocks.keys())),
-            ("sum across exchanges",     lambda: sum(
-                sum(1 for _ in getattr(self.api.Contracts.Stocks, ex, []))
-                for ex in ("TSE", "OTC", "OES")
-            )),
-        ]:
+        # 抽樣驗證：嘗試從 PINNED_STOCKS 取得 5 檔合約，確認可正常存取
+        sample_codes = list(PINNED_STOCKS)[:5]
+        sample_ok = 0
+        for code in sample_codes:
             try:
-                stk_count = counter()
-                print(f"[初始化][診斷] 計數方式「{method_name}」→ {stk_count}")
-                if stk_count > 0:
-                    if stk_count >= MIN_CONTRACT_COUNT:
-                        contracts_loaded = True
-                        print(f"[初始化] ✅ 合約數 {stk_count} ≥ 門檻 {MIN_CONTRACT_COUNT}")
-                    else:
-                        print(
-                            f"[初始化] ⚠️ 合約數 {stk_count} < 門檻 {MIN_CONTRACT_COUNT}，"
-                            f"將進入 fetch_contracts 重試流程"
-                        )
-                    break
+                c = self.api.Contracts.Stocks[code]
+                if c is not None:
+                    sample_ok += 1
             except Exception as e:
-                print(f"[初始化][診斷] 計數方式「{method_name}」失敗: {type(e).__name__}: {e}")
-
-        # 永豐後端 PySolace 偶有逾時，採用指數退避重試（5s → 15s → 30s → 60s → 120s）
-        # 並逐步加大 timeout，最後一次嘗試 reconnect session
-        MAX_CONTRACT_RETRIES = 5
-        BACKOFF_SECS = [5, 15, 30, 60, 120]
-        contract_ok = contracts_loaded   # login 已載入合約 → 跳過重試
-        last_error: str = ""
-        if contract_ok:
-            print("[初始化] 合約已由 login(fetch_contract=True) 載入，跳過 fetch_contracts 重試")
+                print(f"[初始化][診斷] 取得 {code} 失敗: {type(e).__name__}: {e}")
+        print(f"[初始化][診斷] 抽樣驗證：{sample_ok}/{len(sample_codes)} 檔可正常取得")
+        if sample_ok >= 3:
+            contracts_loaded = True
+            print(f"[初始化] ✅ 合約抽樣驗證通過")
         else:
-            print("[初始化] 下載合約中（login 未一併下載）...")
-        for _retry in range(MAX_CONTRACT_RETRIES):
-            if contract_ok:
-                break
-            try:
-                timeout_ms = 60000 + _retry * 30000   # 60s → 180s
-                print(
-                    f"[初始化] [API:fetch_contracts] 嘗試 {_retry + 1}/{MAX_CONTRACT_RETRIES}  "
-                    f"參數: contract_download=True, contracts_timeout={timeout_ms}ms"
-                )
-                self.api.fetch_contracts(
-                    contract_download=True,
-                    contracts_timeout=timeout_ms,
-                    contracts_cb=lambda: print("[初始化] [API:fetch_contracts] callback ─ 合約下載完成"),
-                )
-                # 數量檢查：嘗試多種方式（不同 Shioaji 版本介面不同）
-                stk_count_after = 0
-                for counter in (
-                    lambda: sum(1 for _ in self.api.Contracts.Stocks),
-                    lambda: len(self.api.Contracts.Stocks),
-                    lambda: sum(
-                        sum(1 for _ in getattr(self.api.Contracts.Stocks, ex, []))
-                        for ex in ("TSE", "OTC", "OES")
-                    ),
-                ):
-                    try:
-                        c = counter()
-                        if c > stk_count_after:
-                            stk_count_after = c
-                    except Exception:
-                        continue
-                print(f"[初始化][診斷] 載入後合約計數 = {stk_count_after}")
-                if stk_count_after < MIN_CONTRACT_COUNT:
-                    last_error = f"合約數量不足: {stk_count_after} < {MIN_CONTRACT_COUNT}"
-                    print(
-                        f"[初始化] [API:fetch_contracts] 回傳: ⚠️ 數量不足 "
-                        f"（{stk_count_after}/{MIN_CONTRACT_COUNT}），視為失敗"
-                    )
-                    wait = BACKOFF_SECS[_retry] if _retry < len(BACKOFF_SECS) else 120
-                    print(f"[初始化] 等 {wait}s 後重試...")
-                    time.sleep(wait)
-                    continue
-                contract_ok = True
-                print(
-                    f"[初始化] [API:fetch_contracts] 回傳: 成功"
-                    f"（共嘗試 {_retry + 1} 次，載入 {stk_count_after} 檔）"
-                )
-                break
-            except Exception as e:
-                import traceback
-                err_type = type(e).__name__
-                err_str  = str(e) or "（無訊息）"
-                err_mod  = type(e).__module__
-                last_error = f"{err_type}: {err_str}"
-                print(
-                    f"[初始化] [API:fetch_contracts] 回傳: ❌ 失敗\n"
-                    f"  異常類型 : {err_mod}.{err_type}\n"
-                    f"  錯誤訊息 : {err_str}\n"
-                    f"  完整堆疊：\n{traceback.format_exc()}"
-                )
-                # 嘗試取得異常物件的額外屬性（Shioaji 自訂例外可能帶 code/detail）
-                extra_attrs = {}
-                for attr in ("code", "detail", "response", "status", "args"):
-                    try:
-                        v = getattr(e, attr, None)
-                        if v is not None:
-                            extra_attrs[attr] = repr(v)[:200]
-                    except Exception:
-                        pass
-                if extra_attrs:
-                    print(f"  例外附加屬性：{extra_attrs}")
-                # 偵測「exclusive access lost」→ session 衝突，嘗試重連
-                if "exclusive access lost" in err_str.lower() or "concurrent" in err_str.lower():
-                    print(f"[初始化] [API:fetch_contracts] 偵測 session 衝突，嘗試 logout/login 重連...")
-                    try:
-                        self.api.logout()
-                        print(f"[初始化] [API:logout] 回傳: 成功")
-                    except Exception as e2:
-                        print(f"[初始化] [API:logout] 例外（忽略）: {type(e2).__name__}: {e2}")
-                    time.sleep(3)
-                    try:
-                        accounts2 = self.api.login(
-                            api_key=api_key, secret_key=secret_key, fetch_contract=False
-                        )
-                        print(f"[初始化] [API:login] 重連回傳: {accounts2}")
-                    except Exception as e3:
-                        print(f"[初始化] [API:login] 重連失敗 {type(e3).__name__}: {e3}")
-                wait = BACKOFF_SECS[_retry] if _retry < len(BACKOFF_SECS) else 120
-                print(f"[初始化] 等 {wait}s 後重試...")
-                time.sleep(wait)
+            print(f"[初始化] ⚠️ 合約抽樣未通過（{sample_ok}/{len(sample_codes)}）")
 
-        if not contract_ok:
-            # 最終仍失敗：推 Telegram 通知並結束（讓 GitHub Actions 標示失敗）
+        # Shioaji 1.5.0：login 已自動下載合約，不再呼叫 fetch_contracts（會引發 concurrent 衝突）
+        # 若抽樣未通過，多等幾秒讓 contracts_cb 完成，再驗證一次
+        if not contracts_loaded:
+            for wait_sec in (5, 10, 20):
+                print(f"[初始化] 等 {wait_sec}s 後重新抽樣驗證...")
+                time.sleep(wait_sec)
+                sample_ok2 = sum(
+                    1 for code in sample_codes
+                    if self._safe_get_contract(code) is not None
+                )
+                print(f"[初始化][診斷] 再次抽樣：{sample_ok2}/{len(sample_codes)} 檔")
+                if sample_ok2 >= 3:
+                    contracts_loaded = True
+                    break
+
+        if not contracts_loaded:
             err_msg = (
-                f"❌ Shioaji [API:fetch_contracts] 連續 {MAX_CONTRACT_RETRIES} 次失敗\n"
-                f"最後錯誤：{last_error or '未知'}\n"
-                f"可能原因：永豐後端維護、session 衝突或網路問題"
+                f"❌ Shioaji 合約載入失敗\n"
+                f"login(contracts_timeout=30000) 後 PINNED_STOCKS 抽樣仍無法取得合約\n"
+                f"Shioaji 版本：1.5.0（可能與 1.5.0 ContractCategory 行為相關）\n"
+                f"建議：稍後重試，或鎖定為較舊穩定版本"
             )
             print(f"[初始化] {err_msg}")
             try:
@@ -883,6 +784,17 @@ class AITradingBot:
     # 零股報價訂閱：訂閱 PINNED_STOCKS BidAsk，快取最新買賣報價
     # Shioaji 無獨立零股 snapshot API；即時報價需透過 quote.subscribe()
     # ------------------------------------------------------------------
+    def _safe_get_contract(self, code: str):
+        """安全取得合約（多種 Shioaji 版本介面相容）"""
+        try:
+            return self.api.Contracts.Stocks[code]
+        except Exception:
+            pass
+        try:
+            return self.api.Contracts.Stocks.get(code)
+        except Exception:
+            return None
+
     def _subscribe_odd_quotes(self) -> None:
         """訂閱所有 PINNED_STOCKS 的 BidAsk 即時報價（盤中零股滑點保護用）"""
 
