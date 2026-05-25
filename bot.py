@@ -462,19 +462,40 @@ class AITradingBot:
         print(f"[初始化] 登入回應：{accounts}")
 
         print("[初始化] 下載合約中...")
-        for _retry in range(3):
+        # 永豐後端 PySolace 偶有逾時，採用指數退避重試（5s → 15s → 30s → 60s → 120s）
+        # 並逐步加大 timeout，最後一次嘗試 reconnect session
+        MAX_CONTRACT_RETRIES = 5
+        BACKOFF_SECS = [5, 15, 30, 60, 120]
+        contract_ok = False
+        for _retry in range(MAX_CONTRACT_RETRIES):
             try:
+                timeout_ms = 60000 + _retry * 30000   # 60s → 180s
+                print(f"[初始化] 合約下載嘗試 {_retry + 1}/{MAX_CONTRACT_RETRIES}（timeout={timeout_ms//1000}s）...")
                 self.api.fetch_contracts(
                     contract_download=True,
-                    contracts_timeout=60000,
+                    contracts_timeout=timeout_ms,
                     contracts_cb=lambda: print("[初始化] 合約下載完成"),
                 )
+                contract_ok = True
                 break
-            except TimeoutError:
-                print(f"[初始化] 合約下載逾時，第 {_retry + 1}/3 次重試...")
-                time.sleep(5)
-        else:
-            raise RuntimeError("合約下載連續 3 次逾時，請稍後重試")
+            except TimeoutError as e:
+                wait = BACKOFF_SECS[_retry] if _retry < len(BACKOFF_SECS) else 120
+                print(f"[初始化] 合約下載逾時 ({e})，等 {wait}s 後重試...")
+                time.sleep(wait)
+            except Exception as e:
+                wait = BACKOFF_SECS[_retry] if _retry < len(BACKOFF_SECS) else 120
+                print(f"[初始化] 合約下載例外 {type(e).__name__}: {e}，等 {wait}s 後重試...")
+                time.sleep(wait)
+
+        if not contract_ok:
+            # 最終仍失敗：推 Telegram 通知並結束（讓 GitHub Actions 標示失敗）
+            err_msg = f"❌ Shioaji 合約下載連續 {MAX_CONTRACT_RETRIES} 次失敗，請稍後重試（可能是永豐後端維護）"
+            print(f"[初始化] {err_msg}")
+            try:
+                send_notify(err_msg)
+            except Exception:
+                pass
+            raise RuntimeError(err_msg)
 
         ca_path = os.environ["CA_CERT_PATH"].strip()
         ca_pass = os.environ["CA_PASSWORD"].strip()
