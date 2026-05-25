@@ -467,29 +467,58 @@ class AITradingBot:
         MAX_CONTRACT_RETRIES = 5
         BACKOFF_SECS = [5, 15, 30, 60, 120]
         contract_ok = False
+        last_error: str = ""
         for _retry in range(MAX_CONTRACT_RETRIES):
             try:
                 timeout_ms = 60000 + _retry * 30000   # 60s → 180s
-                print(f"[初始化] 合約下載嘗試 {_retry + 1}/{MAX_CONTRACT_RETRIES}（timeout={timeout_ms//1000}s）...")
+                print(
+                    f"[初始化] [API:fetch_contracts] 嘗試 {_retry + 1}/{MAX_CONTRACT_RETRIES}  "
+                    f"參數: contract_download=True, contracts_timeout={timeout_ms}ms"
+                )
                 self.api.fetch_contracts(
                     contract_download=True,
                     contracts_timeout=timeout_ms,
-                    contracts_cb=lambda: print("[初始化] 合約下載完成"),
+                    contracts_cb=lambda: print("[初始化] [API:fetch_contracts] callback ─ 合約下載完成"),
                 )
                 contract_ok = True
+                print(f"[初始化] [API:fetch_contracts] 回傳: 成功（共嘗試 {_retry + 1} 次）")
                 break
-            except TimeoutError as e:
-                wait = BACKOFF_SECS[_retry] if _retry < len(BACKOFF_SECS) else 120
-                print(f"[初始化] 合約下載逾時 ({e})，等 {wait}s 後重試...")
-                time.sleep(wait)
             except Exception as e:
+                err_type = type(e).__name__
+                err_str  = str(e) or "（無訊息）"
+                last_error = f"{err_type}: {err_str}"
+                print(
+                    f"[初始化] [API:fetch_contracts] 回傳: ❌ 失敗\n"
+                    f"  異常類型 : {err_type}\n"
+                    f"  錯誤訊息 : {err_str}"
+                )
+                # 偵測「exclusive access lost」→ session 衝突，嘗試重連
+                if "exclusive access lost" in err_str.lower() or "concurrent" in err_str.lower():
+                    print(f"[初始化] [API:fetch_contracts] 偵測 session 衝突，嘗試 logout/login 重連...")
+                    try:
+                        self.api.logout()
+                        print(f"[初始化] [API:logout] 回傳: 成功")
+                    except Exception as e2:
+                        print(f"[初始化] [API:logout] 例外（忽略）: {type(e2).__name__}: {e2}")
+                    time.sleep(3)
+                    try:
+                        accounts2 = self.api.login(
+                            api_key=api_key, secret_key=secret_key, fetch_contract=False
+                        )
+                        print(f"[初始化] [API:login] 重連回傳: {accounts2}")
+                    except Exception as e3:
+                        print(f"[初始化] [API:login] 重連失敗 {type(e3).__name__}: {e3}")
                 wait = BACKOFF_SECS[_retry] if _retry < len(BACKOFF_SECS) else 120
-                print(f"[初始化] 合約下載例外 {type(e).__name__}: {e}，等 {wait}s 後重試...")
+                print(f"[初始化] 等 {wait}s 後重試...")
                 time.sleep(wait)
 
         if not contract_ok:
             # 最終仍失敗：推 Telegram 通知並結束（讓 GitHub Actions 標示失敗）
-            err_msg = f"❌ Shioaji 合約下載連續 {MAX_CONTRACT_RETRIES} 次失敗，請稍後重試（可能是永豐後端維護）"
+            err_msg = (
+                f"❌ Shioaji [API:fetch_contracts] 連續 {MAX_CONTRACT_RETRIES} 次失敗\n"
+                f"最後錯誤：{last_error or '未知'}\n"
+                f"可能原因：永豐後端維護、session 衝突或網路問題"
+            )
             print(f"[初始化] {err_msg}")
             try:
                 send_notify(err_msg)
