@@ -454,21 +454,46 @@ class AITradingBot:
         secret_key = os.environ["SECRET_KEY"].strip()
 
         print(f"[初始化] 嘗試登入（API_KEY 長度={len(api_key)}，SECRET_KEY 長度={len(secret_key)}）")
+        # fetch_contract=True：由 Shioaji 內部一次完成 login + 合約下載
+        # 避免「login 後背景訂閱 APISUB/V1/SYS/CONTRACT」與「我們手動 fetch_contracts」競爭
         accounts = self.api.login(
             api_key=api_key,
             secret_key=secret_key,
-            fetch_contract=False,
+            fetch_contract=True,
         )
         print(f"[初始化] 登入回應：{accounts}")
 
-        print("[初始化] 下載合約中...")
+        # 檢查合約是否已透過 login 載入（避免重複下載觸發 concurrent 衝突）
+        # 完整載入後台股應有 2,000+ 檔（TWSE ~1,000 + OTC ~800 + ETF + 興櫃）
+        # 低於 MIN_CONTRACT_COUNT 視為不完整，仍進入重試流程
+        MIN_CONTRACT_COUNT = 1500
+        contracts_loaded = False
+        try:
+            stk_count = len(self.api.Contracts.Stocks)
+            print(f"[初始化] [login fetch_contract=True] 已載入 {stk_count} 檔股票合約")
+            if stk_count >= MIN_CONTRACT_COUNT:
+                contracts_loaded = True
+            else:
+                print(
+                    f"[初始化] ⚠️ 合約數 {stk_count} < 門檻 {MIN_CONTRACT_COUNT}，"
+                    f"視為下載不完整，將進入 fetch_contracts 重試流程"
+                )
+        except Exception as e:
+            print(f"[初始化] 合約計數失敗（將進入重試流程）: {type(e).__name__}: {e}")
+
         # 永豐後端 PySolace 偶有逾時，採用指數退避重試（5s → 15s → 30s → 60s → 120s）
         # 並逐步加大 timeout，最後一次嘗試 reconnect session
         MAX_CONTRACT_RETRIES = 5
         BACKOFF_SECS = [5, 15, 30, 60, 120]
-        contract_ok = False
+        contract_ok = contracts_loaded   # login 已載入合約 → 跳過重試
         last_error: str = ""
+        if contract_ok:
+            print("[初始化] 合約已由 login(fetch_contract=True) 載入，跳過 fetch_contracts 重試")
+        else:
+            print("[初始化] 下載合約中（login 未一併下載）...")
         for _retry in range(MAX_CONTRACT_RETRIES):
+            if contract_ok:
+                break
             try:
                 timeout_ms = 60000 + _retry * 30000   # 60s → 180s
                 print(
@@ -480,8 +505,23 @@ class AITradingBot:
                     contracts_timeout=timeout_ms,
                     contracts_cb=lambda: print("[初始化] [API:fetch_contracts] callback ─ 合約下載完成"),
                 )
+                # 數量檢查：確認真的有完整下載
+                stk_count_after = len(self.api.Contracts.Stocks)
+                if stk_count_after < MIN_CONTRACT_COUNT:
+                    last_error = f"合約數量不足: {stk_count_after} < {MIN_CONTRACT_COUNT}"
+                    print(
+                        f"[初始化] [API:fetch_contracts] 回傳: ⚠️ 數量不足 "
+                        f"（{stk_count_after}/{MIN_CONTRACT_COUNT}），視為失敗"
+                    )
+                    wait = BACKOFF_SECS[_retry] if _retry < len(BACKOFF_SECS) else 120
+                    print(f"[初始化] 等 {wait}s 後重試...")
+                    time.sleep(wait)
+                    continue
                 contract_ok = True
-                print(f"[初始化] [API:fetch_contracts] 回傳: 成功（共嘗試 {_retry + 1} 次）")
+                print(
+                    f"[初始化] [API:fetch_contracts] 回傳: 成功"
+                    f"（共嘗試 {_retry + 1} 次，載入 {stk_count_after} 檔）"
+                )
                 break
             except Exception as e:
                 err_type = type(e).__name__
