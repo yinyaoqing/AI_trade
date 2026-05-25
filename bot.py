@@ -798,8 +798,9 @@ class AITradingBot:
     def _subscribe_odd_quotes(self) -> None:
         """訂閱所有 PINNED_STOCKS 的 BidAsk 即時報價（盤中零股滑點保護用）"""
 
+        # Shioaji 1.5.0：改為 1-argument callback（舊版 2-arg 已棄用）
         @self.api.on_bidask_stk_v1()
-        def _on_bidask(_exchange, bidask) -> None:
+        def _on_bidask(bidask) -> None:
             """接收 BidAsk 推播並更新快取（bid_price[0] / ask_price[0] 為最優報價）"""
             code = getattr(bidask, "code", None)
             if code is None:
@@ -816,10 +817,12 @@ class AITradingBot:
         for code in PINNED_STOCKS:
             try:
                 contract = self.api.Contracts.Stocks[code]
-                self.api.quote.subscribe(
+                # Shioaji 1.5.0：api.quote.subscribe 已棄用 → 改用 api.subscribe
+                # QuoteType / QuoteVersion 移至頂層 sj 命名空間
+                self.api.subscribe(
                     contract,
-                    quote_type=sj.constant.QuoteType.BidAsk,
-                    version=sj.constant.QuoteVersion.v1,
+                    quote_type=sj.QuoteType.BidAsk,
+                    version=sj.QuoteVersion.v1,
                 )
                 subscribed += 1
             except Exception as e:
@@ -968,7 +971,7 @@ class AITradingBot:
     def _sync_positions_from_api(self) -> None:
         """查詢券商實際持倉，載入 self.positions，避免重啟後遺漏持股"""
         try:
-            held = self.api.list_positions(self.api.stock_account, unit=sj.constant.Unit.Share)
+            held = self.api.list_positions(self.api.stock_account, unit=sj.Unit.Share)
             if not held:
                 print("[持倉] 目前無持股")
                 return
@@ -1045,7 +1048,7 @@ class AITradingBot:
     def get_positions_summary(self) -> str:
         """回傳持倉摘要字串（供啟動通知與定時推播使用）"""
         try:
-            held = self.api.list_positions(self.api.stock_account, unit=sj.constant.Unit.Share)
+            held = self.api.list_positions(self.api.stock_account, unit=sj.Unit.Share)
         except Exception as e:
             return f"（持倉查詢失敗: {e}）"
 
@@ -1188,7 +1191,7 @@ class AITradingBot:
         # 持倉市值
         position_value = 0.0
         try:
-            held = self.api.list_positions(self.api.stock_account, unit=sj.constant.Unit.Share)
+            held = self.api.list_positions(self.api.stock_account, unit=sj.Unit.Share)
             for p in (held or []):
                 qty  = int(getattr(p, "quantity", 0))
                 last = float(getattr(p, "last_price", 0) or 0)
@@ -1655,7 +1658,7 @@ class AITradingBot:
         except Exception as e:
             print(f"[價格漂移] {c.code} 重抓 snapshot 失敗（沿用原價）: {e}")
 
-        ok = self._place_odd_order(contract, c.price, c.qty, sj.constant.Action.Buy)
+        ok = self._place_odd_order(contract, c.price, c.qty, sj.Action.Buy)
         if not ok:
             print(f"[買進] {c.code} 下單被拒，跳過。")
             return
@@ -1956,13 +1959,13 @@ class AITradingBot:
         contract = self.api.Contracts.Stocks[code]
         # 查詢實際持倉數量
         try:
-            held = self.api.list_positions(self.api.stock_account, unit=sj.constant.Unit.Share)
+            held = self.api.list_positions(self.api.stock_account, unit=sj.Unit.Share)
             hold = next((p for p in held if p.code == code), None)
             qty = hold.quantity if hold else pos.qty
         except Exception:
             qty = pos.qty
 
-        ok = self._place_odd_order(contract, price, qty, sj.constant.Action.Sell)
+        ok = self._place_odd_order(contract, price, qty, sj.Action.Sell)
         if not ok:
             print(f"[警告] {code} 賣單被拒，部位保留，下輪繼續監控。")
             return
@@ -2056,9 +2059,9 @@ class AITradingBot:
             price=price,
             quantity=qty,
             action=action,
-            price_type=sj.constant.StockPriceType.LMT,
-            order_type=sj.constant.OrderType.ROD,
-            order_lot=sj.constant.StockOrderLot.IntradayOdd,
+            price_type=sj.StockPriceType.LMT,
+            order_type=sj.OrderType.ROD,
+            order_lot=sj.StockOrderLot.IntradayOdd,
             account=self.api.stock_account,
         )
         trade = self.api.place_order(contract, order)
@@ -2267,7 +2270,7 @@ class AITradingBot:
         - 數量不一致 → 以 API 為準更新
         """
         try:
-            held = self.api.list_positions(self.api.stock_account, unit=sj.constant.Unit.Share)
+            held = self.api.list_positions(self.api.stock_account, unit=sj.Unit.Share)
         except Exception as e:
             print(f"[部位校驗] 查詢失敗: {e}")
             return
