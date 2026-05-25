@@ -468,20 +468,54 @@ class AITradingBot:
         # 低於 MIN_CONTRACT_COUNT 視為不完整，仍進入重試流程
         MIN_CONTRACT_COUNT = 1500
         contracts_loaded = False
+        # 環境診斷：版本、屬性、可用方法
         try:
-            # Shioaji 1.3.x Contracts.Stocks 是 ContractCategory 不支援 len()
-            # 改用 iter() 計數（同時相容 1.2.x dict-like）
-            stk_count = sum(1 for _ in self.api.Contracts.Stocks)
-            print(f"[初始化] [login fetch_contract=True] 已載入 {stk_count} 檔股票合約")
-            if stk_count >= MIN_CONTRACT_COUNT:
-                contracts_loaded = True
-            else:
-                print(
-                    f"[初始化] ⚠️ 合約數 {stk_count} < 門檻 {MIN_CONTRACT_COUNT}，"
-                    f"視為下載不完整，將進入 fetch_contracts 重試流程"
-                )
+            import shioaji as _sj
+            sj_ver = getattr(_sj, "__version__", "unknown")
+            print(f"[初始化][診斷] Shioaji 版本: {sj_ver}")
         except Exception as e:
-            print(f"[初始化] 合約計數失敗（將進入重試流程）: {type(e).__name__}: {e}")
+            print(f"[初始化][診斷] 取得 Shioaji 版本失敗: {e}")
+        try:
+            import pysolace as _ps
+            ps_ver = getattr(_ps, "__version__", "unknown")
+            print(f"[初始化][診斷] pysolace 版本: {ps_ver}")
+        except Exception as e:
+            print(f"[初始化][診斷] 取得 pysolace 版本失敗: {e}")
+        try:
+            ct_type = type(self.api.Contracts).__name__
+            stk_type = type(self.api.Contracts.Stocks).__name__
+            print(f"[初始化][診斷] Contracts 類型: {ct_type}, Contracts.Stocks 類型: {stk_type}")
+            # 列出 Contracts.Stocks 的可用方法（找出計數方式）
+            attrs = [a for a in dir(self.api.Contracts.Stocks) if not a.startswith("_")][:20]
+            print(f"[初始化][診斷] Contracts.Stocks 公開屬性: {attrs}")
+        except Exception as e:
+            print(f"[初始化][診斷] Contracts 型別檢查失敗: {type(e).__name__}: {e}")
+
+        # 嘗試多種計數方式
+        for method_name, counter in [
+            ("sum(1 for _ in Stocks)",   lambda: sum(1 for _ in self.api.Contracts.Stocks)),
+            ("len(Stocks)",              lambda: len(self.api.Contracts.Stocks)),
+            ("len(Stocks.keys())",       lambda: len(self.api.Contracts.Stocks.keys())),
+            ("sum across exchanges",     lambda: sum(
+                sum(1 for _ in getattr(self.api.Contracts.Stocks, ex, []))
+                for ex in ("TSE", "OTC", "OES")
+            )),
+        ]:
+            try:
+                stk_count = counter()
+                print(f"[初始化][診斷] 計數方式「{method_name}」→ {stk_count}")
+                if stk_count > 0:
+                    if stk_count >= MIN_CONTRACT_COUNT:
+                        contracts_loaded = True
+                        print(f"[初始化] ✅ 合約數 {stk_count} ≥ 門檻 {MIN_CONTRACT_COUNT}")
+                    else:
+                        print(
+                            f"[初始化] ⚠️ 合約數 {stk_count} < 門檻 {MIN_CONTRACT_COUNT}，"
+                            f"將進入 fetch_contracts 重試流程"
+                        )
+                    break
+            except Exception as e:
+                print(f"[初始化][診斷] 計數方式「{method_name}」失敗: {type(e).__name__}: {e}")
 
         # 永豐後端 PySolace 偶有逾時，採用指數退避重試（5s → 15s → 30s → 60s → 120s）
         # 並逐步加大 timeout，最後一次嘗試 reconnect session
@@ -507,8 +541,23 @@ class AITradingBot:
                     contracts_timeout=timeout_ms,
                     contracts_cb=lambda: print("[初始化] [API:fetch_contracts] callback ─ 合約下載完成"),
                 )
-                # 數量檢查：確認真的有完整下載
-                stk_count_after = sum(1 for _ in self.api.Contracts.Stocks)
+                # 數量檢查：嘗試多種方式（不同 Shioaji 版本介面不同）
+                stk_count_after = 0
+                for counter in (
+                    lambda: sum(1 for _ in self.api.Contracts.Stocks),
+                    lambda: len(self.api.Contracts.Stocks),
+                    lambda: sum(
+                        sum(1 for _ in getattr(self.api.Contracts.Stocks, ex, []))
+                        for ex in ("TSE", "OTC", "OES")
+                    ),
+                ):
+                    try:
+                        c = counter()
+                        if c > stk_count_after:
+                            stk_count_after = c
+                    except Exception:
+                        continue
+                print(f"[初始化][診斷] 載入後合約計數 = {stk_count_after}")
                 if stk_count_after < MIN_CONTRACT_COUNT:
                     last_error = f"合約數量不足: {stk_count_after} < {MIN_CONTRACT_COUNT}"
                     print(
@@ -526,14 +575,28 @@ class AITradingBot:
                 )
                 break
             except Exception as e:
+                import traceback
                 err_type = type(e).__name__
                 err_str  = str(e) or "（無訊息）"
+                err_mod  = type(e).__module__
                 last_error = f"{err_type}: {err_str}"
                 print(
                     f"[初始化] [API:fetch_contracts] 回傳: ❌ 失敗\n"
-                    f"  異常類型 : {err_type}\n"
-                    f"  錯誤訊息 : {err_str}"
+                    f"  異常類型 : {err_mod}.{err_type}\n"
+                    f"  錯誤訊息 : {err_str}\n"
+                    f"  完整堆疊：\n{traceback.format_exc()}"
                 )
+                # 嘗試取得異常物件的額外屬性（Shioaji 自訂例外可能帶 code/detail）
+                extra_attrs = {}
+                for attr in ("code", "detail", "response", "status", "args"):
+                    try:
+                        v = getattr(e, attr, None)
+                        if v is not None:
+                            extra_attrs[attr] = repr(v)[:200]
+                    except Exception:
+                        pass
+                if extra_attrs:
+                    print(f"  例外附加屬性：{extra_attrs}")
                 # 偵測「exclusive access lost」→ session 衝突，嘗試重連
                 if "exclusive access lost" in err_str.lower() or "concurrent" in err_str.lower():
                     print(f"[初始化] [API:fetch_contracts] 偵測 session 衝突，嘗試 logout/login 重連...")
