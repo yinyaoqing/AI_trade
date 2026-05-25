@@ -469,7 +469,9 @@ class AITradingBot:
         MIN_CONTRACT_COUNT = 1500
         contracts_loaded = False
         try:
-            stk_count = len(self.api.Contracts.Stocks)
+            # Shioaji 1.3.x Contracts.Stocks 是 ContractCategory 不支援 len()
+            # 改用 iter() 計數（同時相容 1.2.x dict-like）
+            stk_count = sum(1 for _ in self.api.Contracts.Stocks)
             print(f"[初始化] [login fetch_contract=True] 已載入 {stk_count} 檔股票合約")
             if stk_count >= MIN_CONTRACT_COUNT:
                 contracts_loaded = True
@@ -506,7 +508,7 @@ class AITradingBot:
                     contracts_cb=lambda: print("[初始化] [API:fetch_contracts] callback ─ 合約下載完成"),
                 )
                 # 數量檢查：確認真的有完整下載
-                stk_count_after = len(self.api.Contracts.Stocks)
+                stk_count_after = sum(1 for _ in self.api.Contracts.Stocks)
                 if stk_count_after < MIN_CONTRACT_COUNT:
                     last_error = f"合約數量不足: {stk_count_after} < {MIN_CONTRACT_COUNT}"
                     print(
@@ -866,6 +868,19 @@ class AITradingBot:
                 print(f"[預算] 帳戶餘額回傳 0（模擬帳戶限制），沿用設定值 {TOTAL_BUDGET:,} 元")
                 return
 
+            # 嘗試取得券商提供的交易上限（Shioaji 1.3+ 新 API）
+            # 若可用即作為硬上限參考，券商的計算包含 T+1/T+2 應收應付 + 信用 + 手續費等
+            broker_buy_limit = None
+            try:
+                limits = self.api.trading_limits()
+                broker_buy_limit = float(getattr(limits, "limit_buy", 0) or 0)
+                if broker_buy_limit > 0:
+                    print(f"[預算] 券商交易上限 trading_limits().limit_buy = {broker_buy_limit:,.0f} 元")
+            except Exception as e:
+                # 1.3.3 或更舊版本可能無此 API，靜默忽略
+                if "object has no attribute" not in str(e):
+                    print(f"[預算] trading_limits 查詢失敗（忽略）: {type(e).__name__}: {e}")
+
             # 查詢未交割淨額
             # 規則：s_date <= today（T+0）的應收/應付皆已反映在 acc_balance，不重複計算
             #        s_date >  today 的才計入
@@ -910,6 +925,7 @@ class AITradingBot:
             self._acc_balance_cache    = acc_balance
             self._future_payable_cache = payable      # 未來應付（負值）
             self._future_recv_cache    = receivable   # 未來應收（正值）
+            self._broker_buy_limit     = broker_buy_limit  # 券商交易上限（可能為 None）
 
             TOTAL_BUDGET   = available
             POSITION_SIZE  = _calc_position_size(TOTAL_BUDGET)
@@ -1824,7 +1840,17 @@ class AITradingBot:
         future_recv   = getattr(self, "_future_recv_cache", 0.0)
         future_pay    = getattr(self, "_future_payable_cache", 0.0)
         strict_cap = acc_bal + future_recv + future_pay - pending_amt - today_buy_cost
-        effective_cap = min(budget_cap, strict_cap)
+
+        # 三層保護：含券商 trading_limits（若可用）
+        broker_cap = getattr(self, "_broker_buy_limit", None)
+        if broker_cap and broker_cap > 0:
+            broker_remaining = broker_cap - pending_amt - today_buy_cost
+            effective_cap = min(budget_cap, strict_cap, broker_remaining)
+            print(f"[掃描] 券商 trading_limits.limit_buy = {broker_cap:,.0f}，"
+                  f"扣除 pending/今日已買後 = {broker_remaining:,.0f}")
+        else:
+            effective_cap = min(budget_cap, strict_cap)
+
         print(
             f"[掃描] 預算上限 budget={budget_cap:,.0f}  "
             f"嚴格={strict_cap:,.0f}（acc {acc_bal:,.0f} + 應收 {future_recv:+,.0f} "
