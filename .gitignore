@@ -1,4 +1,11 @@
 .env
+
+# 憑證/金鑰，嚴禁進版控
+*.pfx
+*.p12
+*.pem
+*.key
+
 __pycache__/
 *.pyc
 *.pyo
