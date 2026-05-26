@@ -595,13 +595,19 @@ class AITradingBot:
         self._register_order_callback()
 
         # 查詢帳戶餘額，動態決定實際可用預算
+        print("[初始化] 階段 1/3：執行預算初始化 _init_budget()...")
         self._init_budget()
+        print("[初始化] 階段 1/3 完成")
 
         # 訂閱 PINNED_STOCKS BidAsk 報價（供零股滑點判斷使用）
+        print("[初始化] 階段 2/3：執行報價訂閱 _subscribe_odd_quotes()...")
         self._subscribe_odd_quotes()
+        print("[初始化] 階段 2/3 完成")
 
         # 啟動時同步實際持倉
+        print("[初始化] 階段 3/3：執行持倉同步 _sync_positions_from_api()...")
         self._sync_positions_from_api()
+        print("[初始化] 階段 3/3 完成，AITradingBot __init__ 結束")
 
     # ------------------------------------------------------------------
     # 漏斗掃描：每日 09:20 執行一次，結果合併至 watch_list
@@ -994,7 +1000,10 @@ class AITradingBot:
     def _sync_positions_from_api(self) -> None:
         """查詢券商實際持倉，載入 self.positions，避免重啟後遺漏持股"""
         try:
+            print("[持倉] 呼叫 list_positions(unit=Share)...")
+            t0 = time.time()
             held = self.api.list_positions(self.api.stock_account, unit=sj.Unit.Share)
+            print(f"[持倉] list_positions 完成（耗時 {time.time()-t0:.2f}s，回傳 {len(held) if held else 0} 筆）")
             if not held:
                 print("[持倉] 目前無持股")
                 return
@@ -1037,7 +1046,10 @@ class AITradingBot:
                 try:
                     pid = getattr(p, "id", None)
                     if pid is not None:
+                        print(f"[持倉] 呼叫 list_position_detail({code}, id={pid})...")
+                        _t = time.time()
                         details = self.api.list_position_detail(self.api.stock_account, pid)
+                        print(f"[持倉] {code} list_position_detail 完成（耗時 {time.time()-_t:.2f}s）")
                         dates = [getattr(d, "date", None) for d in (details or [])]
                         dates = [d for d in dates if d]
                         if dates:
