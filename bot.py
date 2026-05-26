@@ -60,6 +60,29 @@ SLIPPAGE_LIMIT       = 0.01    # 滑點保護：買賣價差 > 1%（零股市場
 MIN_ORDER_VALUE      = 11_000   # 最小下單金額（元）：確保手續費占比 < 0.1%，避免最低手續費侵蝕獲利
 
 
+def _shioaji_obj_to_dict(obj) -> dict:
+    """
+    將 Shioaji 物件（KBars/Ticks）轉成 dict 給 pandas.DataFrame 使用。
+    Shioaji 1.5.0：移除 .model_dump()，需用其他方式
+    優先順序：model_dump → dict → __dict__ → 公開屬性逐一取值
+    """
+    if hasattr(obj, "model_dump"):
+        return obj.model_dump()
+    if hasattr(obj, "dict") and callable(obj.dict):
+        try:
+            return obj.dict()
+        except Exception:
+            pass
+    # Pydantic v2 / dataclass 風格
+    if hasattr(obj, "__fields__"):
+        return {f: getattr(obj, f) for f in obj.__fields__}
+    # 一般物件：取所有公開非 callable 屬性
+    return {
+        a: getattr(obj, a) for a in dir(obj)
+        if not a.startswith("_") and not callable(getattr(obj, a, None))
+    }
+
+
 def _business_days_between(start_date, end_date) -> int:
     """計算兩日期間的工作天數（不含週末，不考慮國定假日）"""
     if start_date >= end_date:
@@ -360,7 +383,7 @@ def get_ai_sentiment(news_text: str) -> tuple[float, str]:
 
 def ticks_to_df(ticks) -> pd.DataFrame:
     """將 Shioaji ticks 轉為 DataFrame，統一欄位名稱為 pandas_ta 所需格式（大寫）"""
-    df = pd.DataFrame({**ticks.model_dump()})
+    df = pd.DataFrame({**_shioaji_obj_to_dict(ticks)})
     df["datetime"] = pd.to_datetime(df["ts"])
     df = df.set_index("datetime").sort_index()
     # Shioaji ticks 欄位皆為小寫，pandas_ta.vwap 需要大寫
@@ -1366,7 +1389,7 @@ class AITradingBot:
             end_date   = now_tw().strftime("%Y-%m-%d")
             start_date = (now_tw() - timedelta(days=60)).strftime("%Y-%m-%d")
             kbars = self.api.kbars(contract, start=start_date, end=end_date)
-            df = pd.DataFrame({**kbars.model_dump()}).sort_values("ts")
+            df = pd.DataFrame({**_shioaji_obj_to_dict(kbars)}).sort_values("ts")
             if len(df) < 15:
                 return fallback
             atr = ta.atr(df["High"], df["Low"], df["Close"], length=14).iloc[-1]
@@ -1397,7 +1420,7 @@ class AITradingBot:
                 start=(now_tw() - timedelta(days=90)).strftime("%Y-%m-%d"),
                 end=now_tw().strftime("%Y-%m-%d"),
             )
-            df = pd.DataFrame({**kbars.model_dump()}).set_index("ts").sort_index()
+            df = pd.DataFrame({**_shioaji_obj_to_dict(kbars)}).set_index("ts").sort_index()
             ma20 = df["Close"].rolling(20).mean().iloc[-1]
             current = df["Close"].iloc[-1]
 
@@ -1509,7 +1532,7 @@ class AITradingBot:
                 end_d   = now_tw().strftime("%Y-%m-%d")
                 start_d = (now_tw() - timedelta(days=7)).strftime("%Y-%m-%d")
                 kb5 = self.api.kbars(contract, start=start_d, end=end_d)
-                kdf5 = pd.DataFrame({**kb5.model_dump()}).sort_values("ts")
+                kdf5 = pd.DataFrame({**_shioaji_obj_to_dict(kb5)}).sort_values("ts")
                 if len(kdf5) >= 2:
                     avg_vol = kdf5["Volume"].iloc[:-1].mean()   # 排除今天，取前幾日均量
                     today_vol = float(df["Volume"].sum())
@@ -1534,7 +1557,7 @@ class AITradingBot:
             kdf = pd.DataFrame()
             try:
                 kb  = self.api.kbars(contract, start=start_d, end=end_d)
-                kdf = pd.DataFrame({**kb.model_dump()}).sort_values("ts")
+                kdf = pd.DataFrame({**_shioaji_obj_to_dict(kb)}).sort_values("ts")
                 atr_s = ta.atr(kdf["High"], kdf["Low"], kdf["Close"], length=14)
                 atr_val = float(atr_s.iloc[-1]) if atr_s is not None and not atr_s.empty else 0.0
             except Exception:

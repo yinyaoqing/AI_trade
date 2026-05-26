@@ -36,6 +36,17 @@ import pandas as pd
 import pandas_ta as ta
 from dotenv import load_dotenv
 
+
+def _kbars_to_dict(obj) -> dict:
+    """Shioaji 1.5.0 KBars/Ticks 無 model_dump，需 fallback"""
+    if hasattr(obj, "model_dump"):
+        return obj.model_dump()
+    if hasattr(obj, "__fields__"):
+        return {f: getattr(obj, f) for f in obj.__fields__}
+    return {a: getattr(obj, a) for a in dir(obj)
+            if not a.startswith("_") and not callable(getattr(obj, a, None))}
+
+
 load_dotenv()
 
 TZ_TW = timezone(timedelta(hours=8))
@@ -249,7 +260,7 @@ class MinuteBacktestEngine:
         try:
             kbars = self.api.kbars(contract, start=trade_date, end=next_date)
             time_mod.sleep(self.API_DELAY_SEC)
-            df = pd.DataFrame({**kbars.model_dump()})
+            df = pd.DataFrame({**_kbars_to_dict(kbars)})
         except Exception as e:
             print(f"  [警告] {code} {trade_date} 資料抓取失敗：{e}")
             return pd.DataFrame()
@@ -281,7 +292,7 @@ class MinuteBacktestEngine:
         try:
             kbars = self.api.kbars(contract, start=start, end=end)
             time_mod.sleep(self.API_DELAY_SEC)
-            raw = kbars.model_dump()
+            raw = _kbars_to_dict(kbars)
             print(f"[Debug] {code} kbars keys={list(raw.keys())}  ts_count={len(raw.get('ts', []))}")
             df = pd.DataFrame(raw)
             print(f"[Debug] {code} 日K rows={len(df)}  start={start}  end={end}")

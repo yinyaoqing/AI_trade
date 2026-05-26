@@ -32,6 +32,16 @@ import pandas as pd
 import pandas_ta as ta
 from dotenv import load_dotenv
 
+
+def _kbars_to_dict(obj) -> dict:
+    """Shioaji 1.5.0 KBars/Ticks 無 model_dump，需 fallback"""
+    if hasattr(obj, "model_dump"):
+        return obj.model_dump()
+    if hasattr(obj, "__fields__"):
+        return {f: getattr(obj, f) for f in obj.__fields__}
+    return {a: getattr(obj, a) for a in dir(obj)
+            if not a.startswith("_") and not callable(getattr(obj, a, None))}
+
 load_dotenv()
 
 TZ_TW = timezone(timedelta(hours=8))
@@ -229,7 +239,7 @@ class BacktestEngine:
     def _get_kbars_sj(self, code: str, start: str, end: str) -> pd.DataFrame:
         contract = self.api.Contracts.Stocks[code]
         kbars = self.api.kbars(contract, start=start, end=end)
-        df = pd.DataFrame({**kbars.model_dump()})
+        df = pd.DataFrame({**_kbars_to_dict(kbars)})
         df["date"] = pd.to_datetime(df["ts"]).dt.date.astype(str)
         df = df.drop_duplicates("date").sort_values("date").reset_index(drop=True)
         return df

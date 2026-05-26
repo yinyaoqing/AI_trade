@@ -24,6 +24,16 @@ from src.ai_trade.news import NewsAggregator
 if TYPE_CHECKING:
     pass
 
+
+def _kbars_to_dict(obj) -> dict:
+    """Shioaji 1.5.0 KBars/Ticks 無 model_dump，需 fallback"""
+    if hasattr(obj, "model_dump"):
+        return obj.model_dump()
+    if hasattr(obj, "__fields__"):
+        return {f: getattr(obj, f) for f in obj.__fields__}
+    return {a: getattr(obj, a) for a in dir(obj)
+            if not a.startswith("_") and not callable(getattr(obj, a, None))}
+
 # ---------------------------------------------------------------------------
 # 參數
 # ---------------------------------------------------------------------------
@@ -135,7 +145,7 @@ class FunnelScanner:
                 if not contract:
                     continue
                 kbars = self.api.kbars(contract, start=start_d, end=today)
-                df = pd.DataFrame({**kbars.model_dump()})
+                df = pd.DataFrame({**_kbars_to_dict(kbars)})
                 if df.empty or len(df) < 21:
                     continue
 
@@ -229,12 +239,12 @@ class FunnelScanner:
 
                     # 昨日全天成交量
                     kbars_yd = self.api.kbars(contract, start=yesterday, end=yesterday)
-                    df_yd = pd.DataFrame({**kbars_yd.model_dump()})
+                    df_yd = pd.DataFrame({**_kbars_to_dict(kbars_yd)})
                     yd_total_vol = df_yd["Volume"].sum() if not df_yd.empty else 0
 
                     # 今日 tick 資料
                     ticks = self.api.ticks(contract, date=today)
-                    df_tk = pd.DataFrame({**ticks.model_dump()})
+                    df_tk = pd.DataFrame({**_kbars_to_dict(ticks)})
                     if df_tk.empty:
                         continue
                     df_tk["datetime"] = pd.to_datetime(df_tk["ts"])

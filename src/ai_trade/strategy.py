@@ -14,6 +14,16 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 
+
+def _kbars_to_dict(obj) -> dict:
+    """Shioaji 1.5.0 KBars 無 model_dump，需 fallback"""
+    if hasattr(obj, "model_dump"):
+        return obj.model_dump()
+    if hasattr(obj, "__fields__"):
+        return {f: getattr(obj, f) for f in obj.__fields__}
+    return {a: getattr(obj, a) for a in dir(obj)
+            if not a.startswith("_") and not callable(getattr(obj, a, None))}
+
 import pandas as pd
 import pandas_ta as ta
 
@@ -45,7 +55,7 @@ def detect_regime(api, lookback_days: int = 60) -> tuple[MarketRegime, float]:
     try:
         contract = api.Contracts.Stocks["0050"]
         kbars = api.kbars(contract, start=start, end=end)
-        df = pd.DataFrame({**kbars.model_dump()}).sort_values("ts")
+        df = pd.DataFrame({**_kbars_to_dict(kbars)}).sort_values("ts")
         if len(df) < 10:
             return MarketRegime.UNKNOWN, 0.0
 
