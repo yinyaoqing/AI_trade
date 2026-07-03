@@ -138,6 +138,7 @@ VWAP_MAX_GAP       = 0.03    # VWAP 乖離率上限：現價超過 VWAP 3% 視�
 ATR_MAX_PCT        = 0.03    # ATR 過熱保護：ATR/股價 > 3% 視為跳空風險過高，不進場
 MA_TREND_PERIOD    = 50      # 趨勢過濾均線：個股現價需在 MA50 之上才進場（回測驗證有效）
 MARKET_INDEX       = "0050"  # 大盤指數代碼（主板用 0050，中小型股可改 0051）
+KBAR_MAX_DAYS      = 28      # kbars 單次查詢最大天數：Shioaji 限制不得超過 30 天，留 2 天安全邊際
 
 SCAN_INTERVAL           = 60    # 主循環間隔（秒）
 NEWS_DIGEST_INTERVAL    = 1800  # 非交易時間新聞推播間隔（秒）
@@ -580,6 +581,11 @@ class AITradingBot:
         # 零股即時報價快取：key=股票代碼, value=(bid, ask)
         # 由 _subscribe_odd_quotes() 持續更新，check_slippage_safe() 優先使用
         self._odd_quotes: dict[str, tuple[float, float]] = {}
+
+        # 日 K 線快取：key=股票代碼, value=(日期字串, 日 K DataFrame)
+        # _daily_kbars() 每個交易日僅抓一次（分段抓 1 分 K 再 resample 成日 K），
+        # 供 MA20/MA50/ATR/RVOL 共用，避免每分鐘重複觸發 Shioaji 30 天上限與速率限制
+        self._daily_cache: dict[str, tuple[str, pd.DataFrame]] = {}
 
         # 委託追蹤：key=stock_code, value={"action","price","qty","amount","trade_obj"}
         # 用於凍結已委託但未成交的資金 / 部位
@@ -1392,25 +1398,85 @@ class AITradingBot:
         return smoothed
 
     # ------------------------------------------------------------------
+    # 1.2a 日 K 線組裝：分段抓 1 分 K → resample 成真正的日線（每日快取）
+    # ------------------------------------------------------------------
+    def _daily_kbars(self, contract, min_bars: int) -> pd.DataFrame:
+        """
+        取得日 K 線（欄位 Open/High/Low/Close/Volume，索引為日期）。
+
+        Shioaji 的 api.kbars 只回傳 1 分 K，且單次查詢不得超過 30 天。
+        本方法將所需區間切成多段（每段 ≤ KBAR_MAX_DAYS 天）分別抓取，
+        合併後 resample 成日 K，才是真正的「日線」——供 MA20/MA50/ATR/RVOL 使用。
+
+        min_bars: 需要的日 K 根數（例如 MA50 需 ≥ 50）。回傳結果經每交易日快取，
+        同一交易日重複呼叫直接命中快取，避免觸發速率限制。
+        """
+        code = getattr(contract, "code", str(contract))
+        today = now_tw().strftime("%Y-%m-%d")
+        cached = self._daily_cache.get(code)
+        if cached and cached[0] == today and len(cached[1]) >= min_bars:
+            return cached[1]
+
+        # 交易日約佔日曆天 62%（扣週末與國定假日），再多抓一段當緩衝
+        need_cal_days = int(min_bars / 0.62) + KBAR_MAX_DAYS
+        end_d = now_tw().date()
+        start_d = end_d - timedelta(days=need_cal_days)
+
+        frames = []
+        seg_end = end_d
+        while seg_end >= start_d:
+            seg_start = max(seg_end - timedelta(days=KBAR_MAX_DAYS - 1), start_d)
+            try:
+                kb = self.api.kbars(
+                    contract,
+                    start=seg_start.strftime("%Y-%m-%d"),
+                    end=seg_end.strftime("%Y-%m-%d"),
+                )
+                seg = pd.DataFrame({**_shioaji_obj_to_dict(kb)})
+                if not seg.empty and "ts" in seg.columns:
+                    frames.append(seg)
+            except Exception:
+                pass  # 某段失敗（如整段皆假日）不影響其餘段
+            seg_end = seg_start - timedelta(days=1)
+
+        if not frames:
+            return pd.DataFrame()
+
+        m = pd.concat(frames, ignore_index=True)
+        m["datetime"] = pd.to_datetime(m["ts"])
+        m = m.set_index("datetime").sort_index()
+        m = m[~m.index.duplicated(keep="last")]   # 去除分段邊界可能的重複分鐘
+        daily = m.resample("1D").agg({
+            "Open": "first", "High": "max", "Low": "min",
+            "Close": "last", "Volume": "sum",
+        }).dropna(subset=["Close"])                # 丟掉週末/假日的空列
+
+        self._daily_cache[code] = (today, daily)
+        return daily
+
+    # ------------------------------------------------------------------
     # 1.2 ATR 動態部位：依個股波動率計算合理股數
     # ------------------------------------------------------------------
-    def get_atr_qty(self, contract, current_price: float) -> int:
-        """回傳 ATR-based 股數（風險均等化），上限為固定預算所能買到的最大股數"""
+    def get_atr_qty(self, contract, current_price: float, atr_val: float | None = None) -> int:
+        """回傳 ATR-based 股數（風險均等化），上限為固定預算所能買到的最大股數。
+
+        atr_val 可由呼叫端傳入（已算好的日 ATR），避免重複抓取日 K；
+        未傳入時自行計算日 ATR。
+        """
         fallback = max(int(POSITION_SIZE / current_price), 1)
         try:
-            end_date   = now_tw().strftime("%Y-%m-%d")
-            start_date = (now_tw() - timedelta(days=60)).strftime("%Y-%m-%d")
-            kbars = self.api.kbars(contract, start=start_date, end=end_date)
-            df = pd.DataFrame({**_shioaji_obj_to_dict(kbars)}).sort_values("ts")
-            if len(df) < 15:
+            if atr_val is None:
+                daily = self._daily_kbars(contract, 25)
+                if len(daily) < 15:
+                    return fallback
+                atr_s = ta.atr(daily["High"], daily["Low"], daily["Close"], length=14)
+                atr_val = float(atr_s.iloc[-1]) if (atr_s is not None and not atr_s.empty) else 0.0
+            if not atr_val or pd.isna(atr_val) or atr_val <= 0:
                 return fallback
-            atr = ta.atr(df["High"], df["Low"], df["Close"], length=14).iloc[-1]
-            if not atr or pd.isna(atr) or atr <= 0:
-                return fallback
-            qty_by_risk   = int(RISK_PER_TRADE / atr)          # 風險控制上限
+            qty_by_risk   = int(RISK_PER_TRADE / atr_val)       # 風險控制上限
             qty_by_budget = int(POSITION_SIZE / current_price)  # 預算上限
             qty = max(min(qty_by_risk, qty_by_budget), 1)
-            print(f"[ATR] {contract.code}  ATR={atr:.2f}  風險部位={qty_by_risk}股  預算上限={qty_by_budget}股  → {qty}股")
+            print(f"[ATR] {contract.code}  日ATR={atr_val:.2f}  風險部位={qty_by_risk}股  預算上限={qty_by_budget}股  → {qty}股")
             return qty
         except Exception as e:
             print(f"[ATR] {contract.code} 計算失敗: {e}，改用預算法")
@@ -1427,14 +1493,21 @@ class AITradingBot:
         """
         try:
             contract = self.api.Contracts.Stocks[MARKET_INDEX]
-            kbars = self.api.kbars(
-                contract,
-                start=(now_tw() - timedelta(days=90)).strftime("%Y-%m-%d"),
-                end=now_tw().strftime("%Y-%m-%d"),
-            )
-            df = pd.DataFrame({**_shioaji_obj_to_dict(kbars)}).set_index("ts").sort_index()
-            ma20 = df["Close"].rolling(20).mean().iloc[-1]
-            current = df["Close"].iloc[-1]
+            daily = self._daily_kbars(contract, 25)   # 需 ≥ 20 根日 K 算月線（每日快取）
+            if len(daily) < 20:
+                print(f"[大盤] 日 K 不足（{len(daily)} 根 < 20），維持上次判斷。")
+                return self._market_trend_up
+            ma20 = daily["Close"].rolling(20).mean().iloc[-1]
+            # current 取即時快照（日 K 快取整日凍結，避免大盤盤中翻空時閘門失效）；
+            # 快照失敗才退回日 K 最後一根收盤
+            current = float(daily["Close"].iloc[-1])
+            try:
+                snap = self.api.snapshots([contract])[0]
+                live = float(getattr(snap, "close", 0) or 0)
+                if live > 0:
+                    current = live
+            except Exception:
+                pass
 
             HYST = 0.001  # 遲滯帶 0.1%
             if current > ma20 * (1 + HYST):
@@ -1538,26 +1611,29 @@ class AITradingBot:
                 print(f"[動能/{stock_code}] 法人持續賣超，跳過。")
                 return None
 
-            # ── 相對成交量 RVOL（Gemini 建議 1）─────────────────────
+            # ── 日 K 線（一次抓取，供 RVOL / ATR / MA50 共用，皆為真正的日線）──
+            daily = self._daily_kbars(contract, MA_TREND_PERIOD + 5)
+
+            # ── 相對成交量 RVOL：今日成交量 vs 前 5 個交易日均量 ──────────
             rvol = 1.0
-            try:
-                end_d   = now_tw().strftime("%Y-%m-%d")
-                start_d = (now_tw() - timedelta(days=7)).strftime("%Y-%m-%d")
-                kb5 = self.api.kbars(contract, start=start_d, end=end_d)
-                kdf5 = pd.DataFrame({**_shioaji_obj_to_dict(kb5)}).sort_values("ts")
-                if len(kdf5) >= 2:
-                    avg_vol = kdf5["Volume"].iloc[:-1].mean()   # 排除今天，取前幾日均量
-                    today_vol = float(df["Volume"].sum())
-                    rvol = today_vol / avg_vol if avg_vol > 0 else 1.0
-            except Exception:
-                pass
+            if len(daily) >= 2:
+                avg_vol = daily["Volume"].iloc[:-1].tail(5).mean()   # 排除今日（最後一列），取前 5 日均量
+                today_vol = float(df["Volume"].sum())                # 今日累計量（來自即時 ticks）
+                if avg_vol and avg_vol > 0:
+                    rvol = today_vol / avg_vol
             print(f"  RVOL={rvol:.2f}（門檻={RVOL_MIN}）")
             if rvol < RVOL_MIN:
                 print(f"[動能/{stock_code}] 量能不足（RVOL={rvol:.2f} < {RVOL_MIN}），跳過。")
                 return None
 
+            # ── 日 ATR（供部位計算、過熱保護、止損共用）────────────────
+            atr_val = 0.0
+            if len(daily) >= 15:
+                atr_s = ta.atr(daily["High"], daily["Low"], daily["Close"], length=14)
+                atr_val = float(atr_s.iloc[-1]) if (atr_s is not None and not atr_s.empty) else 0.0
+
             # ── ATR 動態部位與止損 ────────────────────────────────────
-            qty = self.get_atr_qty(contract, current_price)
+            qty = self.get_atr_qty(contract, current_price, atr_val)
             if qty < 1:
                 return None
             # 最小下單金額：防止手續費侵蝕（零股最低手續費陷阱）
@@ -1565,26 +1641,16 @@ class AITradingBot:
                 print(f"[動能/{stock_code}] 下單金額 {qty * current_price:,.0f} 元 < 最低 {MIN_ORDER_VALUE:,} 元，跳過。")
                 return None
 
-            atr_val = 0.0
-            kdf = pd.DataFrame()
-            try:
-                kb  = self.api.kbars(contract, start=start_d, end=end_d)
-                kdf = pd.DataFrame({**_shioaji_obj_to_dict(kb)}).sort_values("ts")
-                atr_s = ta.atr(kdf["High"], kdf["Low"], kdf["Close"], length=14)
-                atr_val = float(atr_s.iloc[-1]) if atr_s is not None and not atr_s.empty else 0.0
-            except Exception:
-                pass
-
             # ── ATR 過熱保護（跳空缺口風險）────────────────────────────
             if atr_val > 0 and (atr_val / current_price) > ATR_MAX_PCT:
                 print(f"[動能/{stock_code}] ATR過熱 {atr_val/current_price:.2%} > {ATR_MAX_PCT:.0%}，跳過。")
                 return None
 
             # ── MA50 趨勢過濾（回測驗證：加入後最大回撤從 -43% 降至 -19%）────
-            if len(kdf) >= MA_TREND_PERIOD:
-                ma50 = kdf["Close"].rolling(MA_TREND_PERIOD).mean().iloc[-1]
+            if len(daily) >= MA_TREND_PERIOD:
+                ma50 = daily["Close"].rolling(MA_TREND_PERIOD).mean().iloc[-1]
                 if not pd.isna(ma50) and current_price < ma50:
-                    print(f"[動能/{stock_code}] 現價 {current_price} < MA50 {ma50:.1f}，下降趨勢，跳過。")
+                    print(f"[動能/{stock_code}] 現價 {current_price} < 日MA50 {ma50:.1f}，下降趨勢，跳過。")
                     return None
 
             # 止損：ATR 止損與固定止損取較嚴格者（止損價較高 = 損失較小），防跳空打滑
