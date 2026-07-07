@@ -141,6 +141,9 @@ MARKET_INDEX       = "0050"  # 大盤指數代碼（主板用 0050，中小型�
 KBAR_MAX_DAYS      = 28      # kbars 單次查詢最大天數：Shioaji 限制不得超過 30 天，留 2 天安全邊際
 
 SCAN_INTERVAL           = 60    # 主循環間隔（秒）
+AUTO_EXIT_AFTER_CLOSE   = os.environ.get("AUTO_EXIT", "1") != "0"  # 收盤後自動結束程序（本地排程模式；設 AUTO_EXIT=0 停用）
+MARKET_CLOSE_EXIT_HOUR   = 13   # 自動結束時間：13:35（零股收盤 13:30 + 緩衝）
+MARKET_CLOSE_EXIT_MINUTE = 35
 NEWS_DIGEST_INTERVAL    = 1800  # 非交易時間新聞推播間隔（秒）
 PENDING_ORDER_TIMEOUT   = 600   # 委託逾時自動撤單（秒）：超過此時間未成交則向交易所送出取消
 BUDGET_REFRESH_INTERVAL = 600   # 預算重查間隔（秒）：每 N 秒重查 settlements() 並推播
@@ -356,6 +359,24 @@ def send_notify(msg: str) -> None:
         args=(token, tg_chat_id.strip(), msg),
         daemon=True,
     ).start()
+
+
+def _set_keep_awake(enable: bool) -> None:
+    """
+    Windows：向系統宣告「工作進行中」，防止交易時段自動進入睡眠。
+    enable=False 解除宣告，讓系統恢復正常睡眠行為。非 Windows 平台為 no-op。
+    """
+    if sys.platform != "win32":
+        return
+    import ctypes
+    ES_CONTINUOUS      = 0x80000000
+    ES_SYSTEM_REQUIRED = 0x00000001
+    flags = ES_CONTINUOUS | (ES_SYSTEM_REQUIRED if enable else 0)
+    try:
+        ctypes.windll.kernel32.SetThreadExecutionState(flags)
+        print(f"[電源] 防睡眠 {'啟用' if enable else '解除'}")
+    except Exception as e:
+        print(f"[電源] SetThreadExecutionState 失敗: {e}")
 
 
 def get_ai_sentiment(news_text: str) -> tuple[float, str]:
@@ -2524,6 +2545,7 @@ class AITradingBot:
 # =============================================================================
 
 if __name__ == "__main__":
+    _set_keep_awake(True)   # 防止系統在初始化與交易時段進入睡眠
     bot = AITradingBot()
     market_agg = NewsAggregator(stock_code="")
 
@@ -2580,6 +2602,18 @@ if __name__ == "__main__":
     try:
         while True:
             now = now_tw()   # 台灣時間
+
+            # 收盤後自動結束：本地排程模式每日自然收工（logout 於 finally 推播當日總結）
+            if AUTO_EXIT_AFTER_CLOSE and (
+                now.hour > MARKET_CLOSE_EXIT_HOUR
+                or (now.hour == MARKET_CLOSE_EXIT_HOUR and now.minute >= MARKET_CLOSE_EXIT_MINUTE)
+            ):
+                print(
+                    f"[{now.strftime('%H:%M:%S')} CST] 已過收盤結束時間 "
+                    f"{MARKET_CLOSE_EXIT_HOUR:02d}:{MARKET_CLOSE_EXIT_MINUTE:02d}，自動結束本日程序。"
+                )
+                break
+
             in_market = (
                 (now.hour == 9 and now.minute >= 5)
                 or (9 < now.hour < 13)
@@ -2694,3 +2728,4 @@ if __name__ == "__main__":
         print("\n[系統] 使用者中止。")
     finally:
         bot.logout()
+        _set_keep_awake(False)   # 解除防睡眠，讓系統恢復正常睡眠
