@@ -1,8 +1,10 @@
 """
-AI 模擬交易機器人
-- 模式：simulation=True（模擬盤，不動用真實資金）
-- 策略：大盤月線過濾 + OpenAI 情緒分析 + VWAP 進場
-        + 滑點保護 + 移動止盈 + 2% 強制止損
+AI 交易機器人
+- 模式：由 AITradingBot.__init__ 的 self._simulation 控制
+        True = 模擬盤（開發測試）；False = 正式交易（⚠️ 實際下單動用真實資金）
+        目前設定：False（正式交易）
+- 策略：大盤月線過濾 + （可選）OpenAI 情緒分析 + VWAP 進場
+        + 滑點保護 + 移動止盈 + ATR/固定止損 + 時間停損
 - 支援：多標的同時監控，最多 MAX_POSITIONS 個部位
 """
 
@@ -140,7 +142,9 @@ MA_TREND_PERIOD    = 50      # 趨勢過濾均線：個股現價需在 MA50 之�
 MARKET_INDEX       = "0050"  # 大盤指數代碼（主板用 0050，中小型股可改 0051）
 KBAR_MAX_DAYS      = 28      # kbars 單次查詢最大天數：Shioaji 限制不得超過 30 天，留 2 天安全邊際
 
-SCAN_INTERVAL           = 60    # 主循環間隔（秒）
+SCAN_INTERVAL           = 60    # 主循環（進場掃描）間隔（秒）
+EXIT_CHECK_INTERVAL     = 30    # 出場監控執行緒間隔（秒）：獨立於進場掃描，止損不被長掃描拖延
+DAILY_CACHE_TTL         = 7200  # 日 K 快取有效期（秒）：盤中每 2 小時重抓，更新當日未完成 K bar
 AUTO_EXIT_AFTER_CLOSE   = os.environ.get("AUTO_EXIT", "1") != "0"  # 收盤後自動結束程序（本地排程模式；設 AUTO_EXIT=0 停用）
 MARKET_CLOSE_EXIT_HOUR   = 13   # 自動結束時間：13:35（零股收盤 13:30 + 緩衝）
 MARKET_CLOSE_EXIT_MINUTE = 35
@@ -154,11 +158,14 @@ FUNNEL_SCAN_HOUR   = 9    # 09:20 觸發
 FUNNEL_SCAN_MINUTE = 20
 FUNNEL_MAX_RESULTS = 5    # 漏斗最多取幾檔加入當日監控清單
 
-# 固定監控標的（不受漏斗掃描影響，每輪必掃）
-# 回測驗證後精選（2021–2026 yfinance 日K，PF ≥ 1.2、夏普 ≥ 1.0、淨損益為正）
+# 固定監控標的（不受漏斗掃描影響）
+# CORE_STOCKS：回測驗證精選（2021–2026 yfinance 日K，PF ≥ 1.1、淨損益為正）→ 每輪完整評估
+# EXTENDED_STOCKS：自選清單（待回測驗證）→ 每輪先經 snapshots 粗篩（漲幅 > 0 且
+#                  成交額 ≥ PREFILTER_MIN_AMOUNT，取漲幅前 PREFILTER_TOP_N 檔）才完整評估，
+#                  避免 70+ 檔全打 ticks/kbars/籌碼 API 造成單輪掃描超過 10 分鐘、拖延止損
 # ★★ = 0050 成分股（零股流動性最佳）；★ = 非 0050 但回測表現優異
 # 移除：2317(PF=0.93)、3037(PF=0.53)、2383(PF=0.43)、2368(PF=0.67)、3661/3443(無成交)、6805(資料不足)
-PINNED_STOCKS: tuple[str, ...] = (
+CORE_STOCKS: tuple[str, ...] = (
     # ── 原有回測驗證清單 ────────────────────────────────────────
     "2059",   # ★  川湖  PF=3.21 Sharpe=4.52
     "8210",   # ★  上緯  PF=1.87 Sharpe=3.63
@@ -173,7 +180,10 @@ PINNED_STOCKS: tuple[str, ...] = (
     "2609",   # ★★ 陽明   PF=1.58 Sharpe=2.55（0050成分，航運）
     "2357",   # ★★ 華碩   PF=1.28 Sharpe=1.35（0050成分）
     "2379",   # ★★ 瑞昱   PF=1.13 Sharpe=0.63（0050成分）
-    # ── 新增自選清單（圖片辨識，待回測驗證）───────────────────
+)
+
+EXTENDED_STOCKS: tuple[str, ...] = (
+    # ── 自選清單（圖片辨識，待回測驗證）───────────────────────
     "6664",   # 群翊
     "6640",   # 均華
     "7772",   # 耀穎
@@ -238,6 +248,14 @@ PINNED_STOCKS: tuple[str, ...] = (
     "2408",   # 南亞科
 )
 
+# 完整監控清單：核心 + 延伸（BidAsk 訂閱、漏斗合併等仍使用完整清單）
+PINNED_STOCKS: tuple[str, ...] = CORE_STOCKS + EXTENDED_STOCKS
+EXTENDED_SET: frozenset[str] = frozenset(EXTENDED_STOCKS)
+
+# 延伸清單粗篩參數（scan_candidates 內使用，一次 snapshots 批次查詢，成本 1 個請求）
+PREFILTER_TOP_N      = 15            # 粗篩後最多取幾檔進入完整評估
+PREFILTER_MIN_AMOUNT = 30_000_000    # 當日累計成交額下限（元）：確保零股流動性
+
 # 長期持有清單：列在此處的股票不納入止損/止盈監控，由人工決定出場時機
 # 適合基本面持股、核心持倉等不希望被短期波動觸發自動賣出的標的
 LONG_TERM_HOLD: frozenset[str] = frozenset([
@@ -249,7 +267,8 @@ LONG_TERM_HOLD: frozenset[str] = frozenset([
     # "0050",   # 元大台灣50
 ])
 
-openai_client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+# SENTIMENT_ENABLED=False 時不建立 client（不強制要求 OPENAI_API_KEY、不產生費用）
+openai_client = OpenAI(api_key=os.environ["OPENAI_API_KEY"]) if SENTIMENT_ENABLED else None
 tg_token   = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 tg_chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
 
@@ -320,9 +339,6 @@ class BuyCandidate:
                 f"RSI={self.rsi:.1f}  法人={self.chip_score:+.2f}  "
                 f"綜合分={self.score:.3f}")
 
-    def pullback_pct(self, current: float) -> float:
-        return (self.max_price - current) / self.max_price
-
 
 # =============================================================================
 # 3. 工具函數
@@ -381,6 +397,8 @@ def _set_keep_awake(enable: bool) -> None:
 
 def get_ai_sentiment(news_text: str) -> tuple[float, str]:
     """OpenAI 語意分析：回傳 (情緒分數 -1.0~1.0, 繁中摘要)"""
+    if openai_client is None:
+        return 0.0, "（情緒分析已關閉）"
     try:
         prompt = (
             "你是台股分析師。請根據以下新聞標題分析對整體台股的影響，"
@@ -417,6 +435,21 @@ def ticks_to_df(ticks) -> pd.DataFrame:
         if col not in df.columns and "Close" in df.columns:
             df[col] = df["Close"]
     return df
+
+
+def ticks_to_minute_df(tick_df: pd.DataFrame, freq: str = "1min") -> pd.DataFrame:
+    """
+    逐筆 ticks 聚合成分鐘 K。
+    RSI 等時間序列指標須用分鐘 K：逐筆 tick 的 RSI-14 等於「最近 14 筆成交」，
+    在成交密集的股票上僅反映數秒內波動，與回測所用的時間序列 RSI 意義完全不同。
+    VWAP 仍用逐筆 ticks 計算（量加權本質不受聚合影響）。
+    """
+    if tick_df.empty:
+        return tick_df
+    return tick_df.resample(freq).agg({
+        "Open": "first", "High": "max", "Low": "min",
+        "Close": "last", "Volume": "sum",
+    }).dropna(subset=["Close"])
 
 
 def sentiment_label(score: float) -> str:
@@ -490,7 +523,7 @@ class AITradingBot:
     def __init__(self):
         _debug_env()
 
-        self._simulation = False   # ← 切換正式交易時改為 False
+        self._simulation = False   # ⚠️ False = 正式交易（實際下單）；開發測試請改 True
         self.api = sj.Shioaji(simulation=self._simulation)
         print("[初始化] Shioaji 實例建立完成")
 
@@ -603,10 +636,10 @@ class AITradingBot:
         # 由 _subscribe_odd_quotes() 持續更新，check_slippage_safe() 優先使用
         self._odd_quotes: dict[str, tuple[float, float]] = {}
 
-        # 日 K 線快取：key=股票代碼, value=(日期字串, 日 K DataFrame)
-        # _daily_kbars() 每個交易日僅抓一次（分段抓 1 分 K 再 resample 成日 K），
-        # 供 MA20/MA50/ATR/RVOL 共用，避免每分鐘重複觸發 Shioaji 30 天上限與速率限制
-        self._daily_cache: dict[str, tuple[str, pd.DataFrame]] = {}
+        # 日 K 線快取：key=股票代碼, value=(日期字串, 抓取時間戳, 日 K DataFrame)
+        # _daily_kbars() 分段抓 1 分 K 再 resample 成日 K，供 MA20/MA50/ATR/RVOL 共用。
+        # 每 DAILY_CACHE_TTL 秒重抓一次：兼顧速率限制與「當日未完成 K bar」的盤中更新
+        self._daily_cache: dict[str, tuple[str, float, pd.DataFrame]] = {}
 
         # 委託追蹤：key=stock_code, value={"action","price","qty","amount","trade_obj"}
         # 用於凍結已委託但未成交的資金 / 部位
@@ -1435,8 +1468,13 @@ class AITradingBot:
         code = getattr(contract, "code", str(contract))
         today = now_tw().strftime("%Y-%m-%d")
         cached = self._daily_cache.get(code)
-        if cached and cached[0] == today and len(cached[1]) >= min_bars:
-            return cached[1]
+        if (
+            cached
+            and cached[0] == today
+            and time.time() - cached[1] < DAILY_CACHE_TTL
+            and len(cached[2]) >= min_bars
+        ):
+            return cached[2]
 
         # 交易日約佔日曆天 62%（扣週末與國定假日），再多抓一段當緩衝
         need_cal_days = int(min_bars / 0.62) + KBAR_MAX_DAYS
@@ -1472,7 +1510,7 @@ class AITradingBot:
             "Close": "last", "Volume": "sum",
         }).dropna(subset=["Close"])                # 丟掉週末/假日的空列
 
-        self._daily_cache[code] = (today, daily)
+        self._daily_cache[code] = (today, time.time(), daily)
         return daily
 
     # ------------------------------------------------------------------
@@ -1597,8 +1635,9 @@ class AITradingBot:
             vwap = ta.vwap(df["High"], df["Low"], df["Close"], df["Volume"]).iloc[-1]
             current_price = df["Close"].iloc[-1]
 
-            # ── RSI 計算 ──────────────────────────────────────────────
-            rsi_series = ta.rsi(df["Close"], length=14)
+            # ── RSI 計算（1 分 K，非逐筆 tick）─────────────────────────
+            min_df = ticks_to_minute_df(df)
+            rsi_series = ta.rsi(min_df["Close"], length=14) if len(min_df) >= 15 else None
             rsi_val = float(rsi_series.iloc[-1]) if (rsi_series is not None and not rsi_series.empty) else 50.0
 
             # ── 動態 RSI 門檻（Gemini 建議 2）─────────────────────────
@@ -1708,7 +1747,8 @@ class AITradingBot:
 
             ticks = self.api.ticks(contract, date=now_tw().strftime("%Y-%m-%d"))
             df    = ticks_to_df(ticks)
-            sig   = mean_reversion_signal(df, stock_code)
+            # RSI 需時間序列意義 → 用 1 分 K 計算（詳見 ticks_to_minute_df 說明）
+            sig   = mean_reversion_signal(ticks_to_minute_df(df), stock_code)
 
             print(f"[均值回歸/{stock_code}]  {sig.reason}")
             if sig.action != "BUY":
@@ -1765,10 +1805,10 @@ class AITradingBot:
                 drift = (cur_price - c.price) / c.price
                 if abs(drift) > 0.005:
                     if drift > 0 and drift <= 0.01:
-                        # 小幅上漲（≤1%）：用新價追單
+                        # 小幅上漲（≤1%）：用新價追單，並依舊價縮減股數維持下單金額一致
                         print(f"[價格漂移] {c.code} 評估價={c.price} → 現價={cur_price}（{drift:+.2%}），改用現價下單")
+                        c.qty   = max(int((c.price * c.qty) / cur_price), 1)
                         c.price = cur_price
-                        c.qty   = max(int((c.price * c.qty) / cur_price), 1)  # 維持金額一致
                     elif drift > 0.01:
                         # 上漲過多：評估時的訊號可能已失效，跳過
                         print(f"[價格漂移] {c.code} 漲幅 {drift:+.2%} > 1%，訊號失效，跳過")
@@ -1825,6 +1865,40 @@ class AITradingBot:
             + fill_note
         )
 
+    def _prefilter_extended(self, watch_list: list) -> set[str]:
+        """
+        延伸清單（EXTENDED_STOCKS，未回測驗證）粗篩：
+        一次 snapshots 批次查詢（成本 1 個請求），條件：
+          - 當日漲幅 > 0（動能策略只做多，弱勢股直接略過）
+          - 當日累計成交額 ≥ PREFILTER_MIN_AMOUNT（零股流動性保障）
+        依漲幅排序取前 PREFILTER_TOP_N 檔進入完整評估。
+        核心清單（CORE_STOCKS）不經粗篩，每輪完整評估。
+        """
+        ext = [c for c in watch_list if c in EXTENDED_SET]
+        if not ext:
+            return set()
+        try:
+            contracts = [self._safe_get_contract(c) for c in ext]
+            contracts = [c for c in contracts if c is not None]
+            snaps = self.api.snapshots(contracts)
+        except Exception as e:
+            print(f"[粗篩] snapshots 查詢失敗，本輪略過延伸清單: {e}")
+            return set()
+
+        scored: list[tuple[float, str]] = []
+        for s in snaps:
+            chg = float(getattr(s, "change_rate", 0) or 0)
+            amt = float(getattr(s, "total_amount", 0) or 0)
+            if chg > 0 and amt >= PREFILTER_MIN_AMOUNT:
+                scored.append((chg, s.code))
+        scored.sort(reverse=True)
+        picked = {code for _, code in scored[:PREFILTER_TOP_N]}
+        print(
+            f"[粗篩] 延伸清單 {len(ext)} 檔 → 符合條件 {len(scored)} 檔 → "
+            f"取前 {len(picked)} 檔完整評估" + (f"：{sorted(picked)}" if picked else "")
+        )
+        return picked
+
     def scan_candidates(
         self,
         watch_list: list,
@@ -1851,8 +1925,15 @@ class AITradingBot:
         for k in expired:
             del self._sell_cooldown[k]
 
-        # ── 評估階段（全部掃完）──────────────────────────────────
+        # ── 延伸清單粗篩（未通過者不做完整評估，控制單輪掃描時間）──
+        prefiltered_ext = self._prefilter_extended(watch_list)
+        skipped_ext = 0
+
+        # ── 評估階段（核心全掃 + 延伸粗篩通過者）──────────────────
         for code in watch_list:
+            if code in EXTENDED_SET and code not in prefiltered_ext:
+                skipped_ext += 1
+                continue
             if code in self.positions:
                 print(f"[{code}] 已持有，跳過。")
                 continue
@@ -1879,6 +1960,9 @@ class AITradingBot:
                 c2 = self._eval_mean_reversion(code, mr_budget)
                 if c2:
                     candidates.append(c2)
+
+        if skipped_ext:
+            print(f"[粗篩] 延伸清單本輪略過 {skipped_ext} 檔（未通過粗篩）")
 
         if not candidates:
             print("[掃描] 本輪無符合條件的候選標的。")
@@ -2558,13 +2642,16 @@ if __name__ == "__main__":
     print(f"滑點上限：{SLIPPAGE_LIMIT:.1%}")
     print("=" * 55)
 
-    # ── 啟動分析 ──
+    # ── 啟動分析（SENTIMENT_ENABLED=False 時跳過 OpenAI，省成本與啟動時間）──
     print("[啟動分析] 抓取新聞中...")
     startup_news   = market_agg.fetch_headlines(limit=10)
     startup_digest = market_agg.format_telegram_digest(limit=10)
-    startup_score, startup_analysis = (
-        get_ai_sentiment(startup_news) if startup_news else (0.0, "無法取得新聞")
-    )
+    if SENTIMENT_ENABLED and startup_news:
+        startup_score, startup_analysis = get_ai_sentiment(startup_news)
+    elif SENTIMENT_ENABLED:
+        startup_score, startup_analysis = 0.0, "無法取得新聞"
+    else:
+        startup_score, startup_analysis = 0.0, "（情緒分析已關閉）"
     print(f"[啟動分析] 情緒分: {startup_score:+.2f}  {startup_analysis}")
 
     positions_summary = bot.get_positions_summary()
@@ -2598,6 +2685,30 @@ if __name__ == "__main__":
     last_digest_sent: float = time.time()
     last_budget_refresh: float = time.time()
     last_status_report: float = time.time()
+
+    # ── 出場監控獨立執行緒 ──────────────────────────────────────
+    # 進場掃描（watch_list 完整評估）單輪可能耗時數分鐘，若止損檢查排在其後
+    # 會被同步拖延。拆至獨立執行緒以固定 EXIT_CHECK_INTERVAL 秒執行，
+    # 覆蓋 09:05–13:30（比進場窗口多 5 分鐘，涵蓋零股收盤撮合前的最後出場機會）。
+    _exit_stop = threading.Event()
+
+    def _exit_monitor_loop() -> None:
+        while not _exit_stop.is_set():
+            _now = now_tw()
+            in_exit_window = (
+                (_now.hour == 9 and _now.minute >= 5)
+                or (9 < _now.hour < 13)
+                or (_now.hour == 13 and _now.minute <= 30)
+            )
+            if in_exit_window:
+                try:
+                    bot.monitor_exit()
+                except Exception as e:
+                    print(f"[出場監控執行緒] 執行失敗: {e}")
+            _exit_stop.wait(EXIT_CHECK_INTERVAL)
+
+    threading.Thread(target=_exit_monitor_loop, name="exit-monitor", daemon=True).start()
+    print(f"[系統] 出場監控執行緒已啟動（每 {EXIT_CHECK_INTERVAL} 秒，獨立於進場掃描）")
 
     try:
         while True:
@@ -2636,8 +2747,8 @@ if __name__ == "__main__":
                     bot.periodic_status_report()
                     last_status_report = time.time()
 
-                # 出場監控（每輪必跑，不受任何過濾影響）
-                bot.monitor_exit()
+                # 出場監控已移至獨立執行緒（exit-monitor，每 EXIT_CHECK_INTERVAL 秒）
+                # 不在主循環執行，避免被進場掃描耗時拖延止損
 
                 # 漏斗掃描（09:20 每日一次，更新當日監控清單）
                 bot.run_funnel_if_needed()
@@ -2727,5 +2838,6 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("\n[系統] 使用者中止。")
     finally:
+        _exit_stop.set()         # 停止出場監控執行緒
         bot.logout()
         _set_keep_awake(False)   # 解除防睡眠，讓系統恢復正常睡眠

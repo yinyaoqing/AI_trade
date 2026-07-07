@@ -41,7 +41,8 @@ TELEGRAM_CHAT_ID=...           # Optional
 
 ```
 AI_trade/
-├── bot.py                    # Main trading bot (live simulation)
+├── bot.py                    # Main trading bot (mode via self._simulation; currently LIVE)
+├── run_bot.ps1               # Task Scheduler launcher (logs to logs/runtime_*.log)
 ├── backtest.py               # Daily-K backtest engine (yfinance or Shioaji)
 ├── minute_backtest.py        # Minute-K backtest engine (Shioaji only)
 ├── main.py                   # API connection & account test
@@ -58,8 +59,17 @@ AI_trade/
 
 ## Running the Bot
 
+⚠️ **Current mode: `self._simulation = False` (LIVE trading, real orders).**
+Flip to `True` in `AITradingBot.__init__` for development.
+
+Production runs via local Windows Task Scheduler task `AI_Trade_Bot`
+(weekdays 08:25, wakes the PC from sleep, runs `run_bot.ps1`, logs to `logs/runtime_*.log`).
+The bot auto-exits at 13:35 TW (`AUTO_EXIT=0` to disable). The GitHub Actions workflow
+keeps only `workflow_dispatch` as a manual fallback (its cron was removed 2026-07 due to
+3–4h GitHub scheduling delays).
+
 ```bash
-# Live simulation trading
+# Run the bot manually
 uv run python bot.py
 
 # Backtest with yfinance (no login required, 5+ years data)
@@ -133,24 +143,31 @@ api.logout()
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `SENTIMENT_ENABLED` | `False` | Toggle AI news sentiment. `False` skips OpenAI calls (saves cost), uses fixed score of `1.0`. |
-| `TOTAL_BUDGET` | 45,000 | Total capital in TWD |
-| `MAX_POSITIONS` | 3 | Max concurrent positions |
-| `STOP_LOSS_PCT` | 0.025 | Fixed stop-loss threshold (2.5%, combined with ATR stop, takes stricter) |
+| `SENTIMENT_ENABLED` | `False` | Toggle AI news sentiment. `False` skips OpenAI entirely (client not created, `OPENAI_API_KEY` not required), uses fixed score of `1.0`. |
+| `TOTAL_BUDGET` | 46,000 | Total capital in TWD (runtime-overridden by `account_balance()` + `settlements()`) |
+| `MAX_POSITIONS` | 7 | Max concurrent positions (effective count limited by `TOTAL_BUDGET // MIN_ORDER_VALUE`) |
+| `STOP_LOSS_PCT` | 0.03 | Fixed stop-loss threshold (3%, combined with ATR stop, takes stricter) |
 | `SLIPPAGE_LIMIT` | 0.01 | Max bid-ask spread (1%) — wider for odd-lot market reality |
-| `MIN_ORDER_VALUE` | 10,000 | Min order value in TWD — prevents fee erosion on tiny odd-lot trades |
+| `MIN_ORDER_VALUE` | 11,000 | Min order value in TWD — prevents fee erosion on tiny odd-lot trades |
 | `TRAILING_START` | 0.015 | Trailing stop activation profit |
-| `TRAILING_PULLBACK` | 0.01 | Trailing stop fallback pullback (when ATR unavailable) |
+| `TRAILING_PULLBACK` | 0.015 | Trailing stop fallback pullback (when ATR unavailable) |
 | `TRAILING_ATR_MULT` | 0.6 | Dynamic trailing: exit when price pulls back 0.6×ATR from peak |
 | `BREAKEVEN_TRIGGER` | 0.02 | Move stop to breakeven when profit reaches 2% |
-| `TIME_STOP_MINUTES` | 30 | Time stop: exit if price stays within ±0.5% of entry for N minutes. Set `0` to disable (swing strategy). |
-| `RVOL_MIN` | 1.5 | Relative volume filter: current bar must be 1.5× 5-bar average |
+| `TIME_STOP_BDAYS` | 5 | Time stop: force exit after N business days if peak profit never reached `TRAILING_START` (swing rule; replaced old `TIME_STOP_MINUTES`) |
+| `RVOL_MIN` | 1.5 | Relative volume filter: today's volume must be 1.5× 5-day average |
 | `VWAP_MAX_GAP` | 0.03 | Max allowed VWAP deviation (3%) — avoids chasing overextended moves |
 | `ATR_MAX_PCT` | 0.03 | Skip entry if ATR/price > 3% (gap risk protection) |
 | `MA_TREND_PERIOD` | 50 | Trend filter: only enter when price > MA50 |
 | `RSI_DYNAMIC` | `True` | Allow RSI threshold to relax to 75 in trending markets |
 | `MARKET_INDEX` | `"0050"` | Market index ticker for regime detection |
-| `PINNED_STOCKS` | 12 tickers | Fixed watchlist — the only scan targets (funnel scan removed) |
+| `SCAN_INTERVAL` | 60 | Entry-scan main loop interval (seconds) |
+| `EXIT_CHECK_INTERVAL` | 30 | Exit-monitor **thread** interval (seconds) — runs independently of entry scan |
+| `DAILY_CACHE_TTL` | 7200 | Daily-K cache lifetime (seconds) — refreshes intraday partial bar every 2h |
+| `AUTO_EXIT_AFTER_CLOSE` | `True` | Auto-exit process at 13:35 TW (local Task Scheduler mode; disable with env `AUTO_EXIT=0`) |
+| `CORE_STOCKS` | 12 tickers | Backtest-validated core watchlist — fully evaluated every scan |
+| `EXTENDED_STOCKS` | 62 tickers | Unvalidated extended watchlist — must pass snapshot prefilter first |
+| `PREFILTER_TOP_N` | 15 | Extended-list prefilter: top N by change_rate enter full evaluation |
+| `PREFILTER_MIN_AMOUNT` | 30,000,000 | Extended-list prefilter: min daily turnover in TWD |
 
 ## Key Backtest Parameters (backtest.py)
 
@@ -162,10 +179,17 @@ api.logout()
 | `TRAILING_ATR_MULT` | 0.6 | Dynamic trailing stop multiplier |
 | `BREAKEVEN_TRIGGER` | 0.02 | Breakeven stop trigger |
 
-## PINNED_STOCKS (12 tickers, backtest-validated 2021–2026)
+## Watchlist: CORE_STOCKS + EXTENDED_STOCKS
+
+`PINNED_STOCKS = CORE_STOCKS + EXTENDED_STOCKS`（74 檔，全部訂閱 BidAsk）。
+
+- **CORE_STOCKS（12 檔，回測驗證 2021–2026）**：每輪進場掃描完整評估。
+- **EXTENDED_STOCKS（62 檔，自選待驗證）**：每輪先經一次 `snapshots()` 批次粗篩
+  （漲幅 > 0 且成交額 ≥ `PREFILTER_MIN_AMOUNT`，取漲幅前 `PREFILTER_TOP_N` 檔）
+  才進入完整評估 — 控制單輪掃描時間，避免 74 檔全打 ticks/kbars/籌碼 API。
 
 ```python
-PINNED_STOCKS = (
+CORE_STOCKS = (
     "2059",   # 川湖  PF=3.21 Sharpe=4.52
     "8210",   # 上緯  PF=1.87 Sharpe=3.63
     "3324",   # 雙鴻  PF=1.69 Sharpe=3.60
@@ -183,14 +207,21 @@ PINNED_STOCKS = (
 
 ## Strategy Architecture
 
-### Main loop (every 60 seconds during 09:05–13:25)
+### Two loops (since 2026-07)
 
+**Exit-monitor thread** — every `EXIT_CHECK_INTERVAL` (30s) during 09:05–13:30, fully
+independent of the entry scan so long scans can never delay stop-losses:
 ```
-1. monitor_exit()       — always runs first, ignores all filters
-2. check_market_trend() — skip entry scan if 0050 < MA20
-3. sentiment score      — SENTIMENT_ENABLED=False → fixed 1.0
-4. allocator.allocate() — TRENDING vs RANGING regime
-5. scan_candidates()    — evaluate all PINNED_STOCKS, rank, buy top scorers
+monitor_exit()  — ATR stop / breakeven / trailing / time stop, ignores all filters
+```
+
+**Entry-scan main loop** — every `SCAN_INTERVAL` (60s) during 09:05–13:25
+(entry scan starts at 09:20 after the early-market filter); process auto-exits at 13:35:
+```
+1. check_market_trend() — skip entry scan if 0050 < MA20 (hysteresis band)
+2. sentiment score      — SENTIMENT_ENABLED=False → fixed 1.0
+3. allocator.allocate() — TRENDING vs RANGING regime
+4. scan_candidates()    — CORE fully evaluated + EXTENDED prefiltered, rank, buy top scorers
 ```
 
 ### StrategyAllocator (strategy.py)
@@ -208,18 +239,19 @@ All must pass:
 2. Slippage OK — bid-ask spread ≤ 1% (from live BidAsk subscription, fallback to snapshot)
 3. `current_price > MA50` — long-term uptrend
 4. `ATR/price ≤ 3%` — not too volatile (gap risk)
-5. `RSI < 70` (or 75 in trending market with `RSI_DYNAMIC=True`)
-6. `0 < VWAP_gap ≤ 3%` — above VWAP but not overextended
+5. `RSI < 70` (or 75 in trending market with `RSI_DYNAMIC=True`) — RSI computed on
+   **1-minute resampled bars** (`ticks_to_minute_df`), never on raw ticks
+6. `0 < VWAP_gap ≤ 3%` — above VWAP but not overextended (VWAP stays tick-based)
 7. `RVOL ≥ 1.5` — volume surge confirmation
 8. `chip_score ≥ -0.3` — institutions not heavily selling
-9. `qty × price ≥ 10,000` — order value above minimum
+9. `qty × price ≥ 11,000` — order value above minimum
 
 ### Exit Logic (4 conditions, in priority order)
 ```
 A. ATR stop  : stop_price = max(entry - 1.5×ATR, entry × (1 - STOP_LOSS_PCT))
 B. Breakeven : move stop to entry when profit ≥ BREAKEVEN_TRIGGER
 C. Trailing  : exit when pullback from peak ≥ max(0.6×ATR/peak, TRAILING_PULLBACK)
-D. Time stop : exit if within ±TIME_STOP_BAND of entry after TIME_STOP_MINUTES (0 = disabled)
+D. Time stop : force exit after TIME_STOP_BDAYS business days if peak profit never reached TRAILING_START
 ```
 
 **Odd-lot T+1 rule**: positions entered today are NEVER exited today (regulatory rule for intraday odd-lot trading).
@@ -258,6 +290,6 @@ MA50 trend filter reduced max drawdown from -43% → -19% on 2330.
 - Never commit API keys or credentials
 - `api.list_trades()` requires account parameter: `api.list_trades(api.stock_account)`
 - Simulation `account_balance()` returns 0 — bot handles this gracefully (keeps default budget)
-- Funnel scanner (`scanner.py`) is **not called** by bot.py — `watch_list` is fixed to `list(PINNED_STOCKS)`
+- Funnel scanner (`scanner.py`) runs once daily at 09:20 via `run_funnel_if_needed()`; its picks are merged into `watch_list` on top of `PINNED_STOCKS`
 - Test with `/shioaji-init` skill to scaffold new features
 - Python 3.12+ required (pandas-ta dependency)
