@@ -1,4 +1,4 @@
-# =============================================================================
+﻿# =============================================================================
 # AI Trade bot 啟動腳本（供 Windows 工作排程器呼叫）
 # - 切換至 repo 目錄，透過 uv 執行 bot.py
 # - stdout/stderr 寫入 logs\runtime_YYYYMMDD.log（bot 內部 print 全數保留）
@@ -22,5 +22,9 @@ if (-not (Test-Path $uv)) {
 }
 
 "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] ── 排程啟動 bot.py ──────────────" | Out-File -Append -Encoding utf8 $log
-& $uv run python bot.py *>> $log
+
+# 透過 cmd 原生轉向寫 log：避免 PowerShell 5.1 將 stderr 包裝成 UTF-16 錯誤記錄造成亂碼
+$env:PYTHONIOENCODING = "utf-8"
+& cmd /c "`"$uv`" run python bot.py >> `"$log`" 2>&1"
+
 "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] ── bot.py 結束（exit=$LASTEXITCODE）──" | Out-File -Append -Encoding utf8 $log

@@ -479,6 +479,8 @@ def _debug_env() -> None:
     vars_info = {
         "API_KEY":            os.environ.get("API_KEY", ""),
         "SECRET_KEY":         os.environ.get("SECRET_KEY", ""),
+        "PROD_API_KEY":       os.environ.get("PROD_API_KEY", ""),
+        "PROD_SECRET_KEY":    os.environ.get("PROD_SECRET_KEY", ""),
         "CA_CERT_PATH":       os.environ.get("CA_CERT_PATH", ""),
         "CA_PASSWORD":        os.environ.get("CA_PASSWORD", ""),
         "OPENAI_API_KEY":     os.environ.get("OPENAI_API_KEY", ""),
@@ -527,9 +529,17 @@ class AITradingBot:
         self.api = sj.Shioaji(simulation=self._simulation)
         print("[初始化] Shioaji 實例建立完成")
 
-        # 清除環境變數中可能夾帶的空白、換行（GitHub Actions Secrets 常見問題）
-        api_key    = os.environ["API_KEY"].strip()
-        secret_key = os.environ["SECRET_KEY"].strip()
+        # 依模式選擇金鑰：模擬 / 正式環境的 API 金鑰是兩組不同的值
+        #   模擬（simulation=True） → API_KEY / SECRET_KEY
+        #   正式（simulation=False）→ 優先 PROD_API_KEY / PROD_SECRET_KEY，
+        #                             未設定時退回 API_KEY（GitHub Actions Secrets 即為正式金鑰）
+        # .strip() 清除可能夾帶的空白、換行（GitHub Actions Secrets 常見問題）
+        if self._simulation:
+            api_key    = os.environ["API_KEY"].strip()
+            secret_key = os.environ["SECRET_KEY"].strip()
+        else:
+            api_key    = (os.environ.get("PROD_API_KEY") or os.environ["API_KEY"]).strip()
+            secret_key = (os.environ.get("PROD_SECRET_KEY") or os.environ["SECRET_KEY"]).strip()
 
         print(f"[初始化] 嘗試登入（API_KEY 長度={len(api_key)}，SECRET_KEY 長度={len(secret_key)}）")
         # Shioaji 1.5.0：login(fetch_contract=True, contracts_timeout=N) 一次完成登入 + 合約下載
@@ -2629,6 +2639,21 @@ class AITradingBot:
 # =============================================================================
 
 if __name__ == "__main__":
+    # 初始化前時段閘門：排程含「解鎖工作站」觸發，週末或收盤後啟動時
+    # 直接結束，不做登入/訂閱/推播（手動測試請設 AUTO_EXIT=0）
+    if AUTO_EXIT_AFTER_CLOSE:
+        _now = now_tw()
+        _after_close = (
+            _now.hour > MARKET_CLOSE_EXIT_HOUR
+            or (_now.hour == MARKET_CLOSE_EXIT_HOUR and _now.minute >= MARKET_CLOSE_EXIT_MINUTE)
+        )
+        if _now.weekday() >= 5 or _after_close:
+            print(
+                f"[{_now.strftime('%Y-%m-%d %H:%M:%S')}] 非交易時段"
+                f"（週末或已過 {MARKET_CLOSE_EXIT_HOUR:02d}:{MARKET_CLOSE_EXIT_MINUTE:02d}），直接結束。"
+            )
+            sys.exit(0)
+
     _set_keep_awake(True)   # 防止系統在初始化與交易時段進入睡眠
     bot = AITradingBot()
     market_agg = NewsAggregator(stock_code="")
